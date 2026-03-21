@@ -1,18 +1,12 @@
-from IEFT.datasets import SYDNEYCaptionKarpathyDataset
+# IEFT/datamodules/sydney_caption_karpathy_datamodule.py
 from .datamodule_base import BaseDataModule
+from IEFT.datasets import SydneyCaptionKarpathyDataset
 
 
 class SydneyCaptionKarpathyDataModule(BaseDataModule):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
     @property
     def dataset_cls(self):
-        return SYDNEYCaptionKarpathyDataset
-
-    @property
-    def dataset_cls_no_false(self):
-        return SYDNEYCaptionKarpathyDataset
+        return SydneyCaptionKarpathyDataset
 
     @property
     def dataset_name(self):

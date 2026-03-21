@@ -1,14 +1,28 @@
 import torch
-import random
+import warnings
 
 from transformers.optimization import AdamW
 from transformers import (
     get_polynomial_decay_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
 )
-from IEFT.modules.dist_utils import all_gather
+
 from IEFT.modules.objectives import compute_irtr_recall
 from IEFT.gadgets.my_metrics import Accuracy, VQAScore, Scalar
+
+
+def _safe_add_scalar(pl_module, tag: str, value, step: int):
+    try:
+        logger = getattr(pl_module, "logger", None)
+        if logger is None:
+            return
+        exp = getattr(logger, "experiment", None)
+        if exp is None:
+            return
+        if hasattr(exp, "add_scalar"):
+            exp.add_scalar(tag, value, step)
+    except Exception:
+        pass
 
 
 def set_metrics(pl_module):
@@ -16,9 +30,11 @@ def set_metrics(pl_module):
         for k, v in pl_module.hparams.config["loss_names"].items():
             if v < 1:
                 continue
+
             if k == "vqa":
                 setattr(pl_module, f"{split}_vqa_score", VQAScore())
                 setattr(pl_module, f"{split}_{k}_loss", Scalar())
+
             elif k == "nlvr2":
                 if split == "train":
                     setattr(pl_module, f"train_{k}_accuracy", Accuracy())
@@ -28,14 +44,18 @@ def set_metrics(pl_module):
                     setattr(pl_module, f"dev_{k}_loss", Scalar())
                     setattr(pl_module, f"test_{k}_accuracy", Accuracy())
                     setattr(pl_module, f"test_{k}_loss", Scalar())
+
             elif k == "irtr":
                 setattr(pl_module, f"{split}_irtr_loss", Scalar())
-            elif k == "mppd" or k == "mpfr":
+
+            elif k in ("mppd", "mpfr"):
                 setattr(pl_module, f"{split}_{k}_loss", Scalar())
+
             elif k == "itm":
                 setattr(pl_module, f"{split}_{k}_accuracy", Accuracy())
                 setattr(pl_module, f"{split}_{k}_loss", Scalar())
                 setattr(pl_module, f"{split}_{k}_wpa_loss", Scalar())
+
             else:
                 setattr(pl_module, f"{split}_{k}_accuracy", Accuracy())
                 setattr(pl_module, f"{split}_{k}_loss", Scalar())
@@ -45,92 +65,78 @@ def epoch_wrapup(pl_module):
     phase = "train" if pl_module.training else "val"
     the_metric = 0
 
-    if pl_module.hparams.config["get_recall_metric"] and not pl_module.training:
-        (ir_r1, ir_r5, ir_r10, tr_r1, tr_r5, tr_r10), results = compute_irtr_recall(pl_module)
+    # Recall computation (safe)
+    if pl_module.hparams.config.get("get_recall_metric", False) and not pl_module.training:
+        try:
+            (ir_r1, ir_r5, ir_r10, tr_r1, tr_r5, tr_r10), results = compute_irtr_recall(pl_module)
 
-        all = sum([ir_r1, ir_r5, ir_r10, tr_r1, tr_r5, tr_r10])/6
-        mean = round(all.item(), 2)
-        ir_r1 = round(ir_r1.item(), 2)
-        ir_r5 = round(ir_r5.item(), 2)
-        ir_r10 = round(ir_r10.item(), 2)
-        tr_r1 = round(tr_r1.item(), 2)
-        tr_r5 = round(tr_r5.item(), 2)
-        tr_r10 = round(tr_r10.item(), 2)
+            if isinstance(results, dict) and results.get("skipped", False):
+                reason = results.get("reason", "unknown")
+                json_path = results.get("json", "")
+                print("################  Recall Skipped  ################")
+                print(f"Reason: {reason} | json: {json_path} | step: {pl_module.global_step}")
+                print("")
+            else:
+                all_mean = (ir_r1 + ir_r5 + ir_r10 + tr_r1 + tr_r5 + tr_r10) / 6.0
+                mean = round(all_mean.item(), 2)
 
-        iir_r1 = results["iir_top1"]
-        iir_r5 = results["iir_top5"]
-        iir_r10 = results["iir_top10"]
-        ttr_r1 = results["ttr_top1"]
-        ttr_r5 = results["ttr_top5"]
-        ttr_r10 = results["ttr_top10"]
-        im_mean= results["mean"]
+                ir_r1_v = round(ir_r1.item(), 2)
+                ir_r5_v = round(ir_r5.item(), 2)
+                ir_r10_v = round(ir_r10.item(), 2)
+                tr_r1_v = round(tr_r1.item(), 2)
+                tr_r5_v = round(tr_r5.item(), 2)
+                tr_r10_v = round(tr_r10.item(), 2)
 
-        print("################  Improved Evaluation Metrics  ################")
-        print(
-            "im_ir_top1: {}%".format(iir_r1),
-            ", im_ir_top5: {}%".format(iir_r5),
-            ", im_ir_top10: {}%".format(iir_r10),
-            ", im_tr_top1: {}%".format(ttr_r1),
-            ", im_tr_top5: {}%".format(ttr_r5),
-            ", im_tr_top10: {}%".format(ttr_r10),
-            " and this is im_mean: {}%".format(im_mean),
-            pl_module.global_step
-        )
-        print("\n")
+                print("################  Original Evaluation Metrics  ################")
+                print(
+                    f"ir_top1: {ir_r1_v}%",
+                    f", ir_top5: {ir_r5_v}%",
+                    f", ir_top10: {ir_r10_v}%",
+                    f", tr_top1: {tr_r1_v}%",
+                    f", tr_top5: {tr_r5_v}%",
+                    f", tr_top10: {tr_r10_v}%",
+                    f" and this is mean: {mean}%",
+                    pl_module.global_step,
+                )
+                print("")
 
-        print("################  Original Evaluation Metrics  ################")
-        print(
-            "ir_top1: {}%".format(ir_r1),
-            ", ir_top5: {}%".format(ir_r5),
-            ", ir_top10: {}%".format(ir_r10),
-            ", tr_top1: {}%".format(tr_r1),
-            ", tr_top5: {}%".format(tr_r5),
-            ", tr_top10: {}%".format(tr_r10),
-            " and this is mean: {}%".format(mean),
-            pl_module.global_step)
-        print("\n")
+                _safe_add_scalar(pl_module, "recalls/ir_r1", ir_r1_v, pl_module.global_step)
+                _safe_add_scalar(pl_module, "recalls/ir_r5", ir_r5_v, pl_module.global_step)
+                _safe_add_scalar(pl_module, "recalls/ir_r10", ir_r10_v, pl_module.global_step)
+                _safe_add_scalar(pl_module, "recalls/tr_r1", tr_r1_v, pl_module.global_step)
+                _safe_add_scalar(pl_module, "recalls/tr_r5", tr_r5_v, pl_module.global_step)
+                _safe_add_scalar(pl_module, "recalls/tr_r10", tr_r10_v, pl_module.global_step)
 
-        pl_module.logger.experiment.add_scalar(
-            "recalls/ir_r1", ir_r1, pl_module.global_step
-        )
-        pl_module.logger.experiment.add_scalar(
-            "recalls/ir_r5", ir_r5, pl_module.global_step
-        )
-        pl_module.logger.experiment.add_scalar(
-            "recalls/ir_r10", ir_r10, pl_module.global_step
-        )
-        pl_module.logger.experiment.add_scalar(
-            "recalls/tr_r1", tr_r1, pl_module.global_step
-        )
-        pl_module.logger.experiment.add_scalar(
-            "recalls/tr_r5", tr_r5, pl_module.global_step
-        )
-        pl_module.logger.experiment.add_scalar(
-            "recalls/tr_r10", tr_r10, pl_module.global_step
-        )
-        the_metric +=  ir_r1 + tr_r1
-        # the_metric += mean
+                # selection metric: keep your original logic
+                the_metric += (ir_r1_v + tr_r1_v)
 
+        except Exception as e:
+            warnings.warn(f"[epoch_wrapup] recall computation failed: {repr(e)}")
+
+    # Standard loss/acc epoch metrics
     for loss_name, v in pl_module.hparams.config["loss_names"].items():
         if v < 1:
             continue
 
         value = 0
-        print(loss_name)
+
         if loss_name == "vqa":
             value = getattr(pl_module, f"{phase}_{loss_name}_score").compute()
             pl_module.log(f"{loss_name}/{phase}/score_epoch", value)
             getattr(pl_module, f"{phase}_{loss_name}_score").reset()
+
             pl_module.log(
                 f"{loss_name}/{phase}/loss_epoch",
                 getattr(pl_module, f"{phase}_{loss_name}_loss").compute(),
             )
             getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
         elif loss_name == "nlvr2":
             if phase == "train":
                 value = getattr(pl_module, f"train_{loss_name}_accuracy").compute()
                 pl_module.log(f"{loss_name}/train/accuracy_epoch", value)
                 getattr(pl_module, f"train_{loss_name}_accuracy").reset()
+
                 pl_module.log(
                     f"{loss_name}/train/loss_epoch",
                     getattr(pl_module, f"train_{loss_name}_loss").compute(),
@@ -140,6 +146,7 @@ def epoch_wrapup(pl_module):
                 value = getattr(pl_module, f"dev_{loss_name}_accuracy").compute()
                 pl_module.log(f"{loss_name}/dev/accuracy_epoch", value)
                 getattr(pl_module, f"dev_{loss_name}_accuracy").reset()
+
                 pl_module.log(
                     f"{loss_name}/dev/loss_epoch",
                     getattr(pl_module, f"dev_{loss_name}_loss").compute(),
@@ -149,41 +156,49 @@ def epoch_wrapup(pl_module):
                 value = getattr(pl_module, f"test_{loss_name}_accuracy").compute()
                 pl_module.log(f"{loss_name}/test/accuracy_epoch", value)
                 getattr(pl_module, f"test_{loss_name}_accuracy").reset()
+
                 pl_module.log(
                     f"{loss_name}/test/loss_epoch",
                     getattr(pl_module, f"test_{loss_name}_loss").compute(),
                 )
                 getattr(pl_module, f"test_{loss_name}_loss").reset()
+
         elif loss_name == "irtr":
             pl_module.log(
                 f"{loss_name}/{phase}/irtr_loss_epoch",
                 getattr(pl_module, f"{phase}_irtr_loss").compute(),
             )
             getattr(pl_module, f"{phase}_irtr_loss").reset()
-        elif loss_name == "mppd" or loss_name == "mpfr":
+
+        elif loss_name in ("mppd", "mpfr"):
             pl_module.log(
                 f"{loss_name}/{phase}/loss_epoch",
                 getattr(pl_module, f"{phase}_{loss_name}_loss").compute(),
             )
             getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
         elif loss_name == "itm":
             value = getattr(pl_module, f"{phase}_{loss_name}_accuracy").compute()
             pl_module.log(f"{loss_name}/{phase}/accuracy_epoch", value)
             getattr(pl_module, f"{phase}_{loss_name}_accuracy").reset()
+
             pl_module.log(
                 f"{loss_name}/{phase}/loss_epoch",
                 getattr(pl_module, f"{phase}_{loss_name}_loss").compute(),
             )
             getattr(pl_module, f"{phase}_{loss_name}_loss").reset()
+
             pl_module.log(
                 f"{loss_name}/{phase}/wpa_loss_epoch",
                 getattr(pl_module, f"{phase}_{loss_name}_wpa_loss").compute(),
             )
             getattr(pl_module, f"{phase}_{loss_name}_wpa_loss").reset()
+
         else:
             value = getattr(pl_module, f"{phase}_{loss_name}_accuracy").compute()
             pl_module.log(f"{loss_name}/{phase}/accuracy_epoch", value)
             getattr(pl_module, f"{phase}_{loss_name}_accuracy").reset()
+
             pl_module.log(
                 f"{loss_name}/{phase}/loss_epoch",
                 getattr(pl_module, f"{phase}_{loss_name}_loss").compute(),
@@ -198,15 +213,12 @@ def epoch_wrapup(pl_module):
 def check_non_acc_grad(pl_module):
     if pl_module.token_type_embeddings.weight.grad is None:
         return True
-    else:
-        grad = pl_module.token_type_embeddings.weight.grad
-        return (grad.sum() == 0).item()
+    grad = pl_module.token_type_embeddings.weight.grad
+    return (grad.sum() == 0).item()
 
 
 def set_task(pl_module):
-    pl_module.current_tasks = [
-        k for k, v in pl_module.hparams.config["loss_names"].items() if v >= 1
-    ]
+    pl_module.current_tasks = [k for k, v in pl_module.hparams.config["loss_names"].items() if v >= 1]
     return
 
 
@@ -231,14 +243,12 @@ def set_schedule(pl_module):
     decay_power = pl_module.hparams.config["decay_power"]
     optim_type = pl_module.hparams.config["optim_type"]
 
-    names = [n for n, p in pl_module.named_parameters()]
     optimizer_grouped_parameters = [
         {
             "params": [
                 p
                 for n, p in pl_module.named_parameters()
-                if not any(nd in n for nd in no_decay)
-                and not any(bb in n for bb in head_names)
+                if not any(nd in n for nd in no_decay) and not any(bb in n for bb in head_names)
             ],
             "weight_decay": wd,
             "lr": lr,
@@ -247,8 +257,7 @@ def set_schedule(pl_module):
             "params": [
                 p
                 for n, p in pl_module.named_parameters()
-                if any(nd in n for nd in no_decay)
-                and not any(bb in n for bb in head_names)
+                if any(nd in n for nd in no_decay) and not any(bb in n for bb in head_names)
             ],
             "weight_decay": 0.0,
             "lr": lr,
@@ -257,8 +266,7 @@ def set_schedule(pl_module):
             "params": [
                 p
                 for n, p in pl_module.named_parameters()
-                if not any(nd in n for nd in no_decay)
-                and any(bb in n for bb in head_names)
+                if not any(nd in n for nd in no_decay) and any(bb in n for bb in head_names)
             ],
             "weight_decay": wd,
             "lr": lr * lr_mult,
@@ -275,13 +283,13 @@ def set_schedule(pl_module):
     ]
 
     if optim_type == "adamw":
-        optimizer = AdamW(
-            optimizer_grouped_parameters, lr=lr, eps=1e-8, betas=(0.9, 0.98)
-        )
+        optimizer = AdamW(optimizer_grouped_parameters, lr=lr, eps=1e-8, betas=(0.9, 0.98))
     elif optim_type == "adam":
         optimizer = torch.optim.Adam(optimizer_grouped_parameters, lr=lr)
     elif optim_type == "sgd":
         optimizer = torch.optim.SGD(optimizer_grouped_parameters, lr=lr, momentum=0.9)
+    else:
+        raise ValueError(f"Unknown optim_type: {optim_type}")
 
     if pl_module.trainer.max_steps is None:
         max_steps = (
@@ -293,7 +301,7 @@ def set_schedule(pl_module):
         max_steps = pl_module.trainer.max_steps
 
     warmup_steps = pl_module.hparams.config["warmup_steps"]
-    if isinstance(pl_module.hparams.config["warmup_steps"], float):
+    if isinstance(warmup_steps, float):
         warmup_steps = int(max_steps * warmup_steps)
 
     if decay_power == "cosine":
@@ -310,10 +318,6 @@ def set_schedule(pl_module):
             lr_end=end_lr,
             power=decay_power,
         )
-    print(decay_power)
-    sched = {"scheduler": scheduler, "interval": "step"}
 
-    return (
-        [optimizer],
-        [sched],
-    )
+    sched = {"scheduler": scheduler, "interval": "step"}
+    return [optimizer], [sched]

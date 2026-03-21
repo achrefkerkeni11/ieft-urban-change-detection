@@ -1,0 +1,22 @@
+# Data and outputs
+data_raw/
+data_osm/
+data_npz/
+features/
+outputs/
+result/
+weights/
+dummy_data/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# HuggingFace cache
+.hf_home/
+
+# OS generated files
+.DS_Store
+Thumbs.db

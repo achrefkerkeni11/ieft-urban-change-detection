@@ -1,6 +1,6 @@
 from sacred import Experiment
 
-ex = Experiment("ViLT")
+ex = Experiment("ViLT", save_git_info=False)
 
 
 def _loss_names(d):
@@ -22,7 +22,7 @@ def config():
     seed = 0
     datasets = ["coco", "vg", "sbu", "gcc"]
     loss_names = _loss_names({"itm": 1, "mlm": 1})
-    batch_size = 4096  # this is a desired batch size; pl trainer will accumulate gradients when per step batch is smaller.
+    batch_size = 4096  # desired effective batch size
 
     # Image setting
     train_transform_keys = ["pixelbert"]
@@ -33,7 +33,7 @@ def config():
     draw_false_image = 1
     image_only = False
 
-    # Text Setting
+    # Text setting
     vqav2_label_size = 3129
     max_text_len = 40
     tokenizer = "bert-base-uncased"
@@ -42,7 +42,12 @@ def config():
     mlm_prob = 0.15
     draw_false_text = 0
 
-    # Transformer Setting
+    # OSM / external text setting
+    osm_texts_json = ""
+    osm_text_mode = "concat"   # first | random | concat
+    osm_max_phrases = 3
+
+    # Transformer setting
     vit = "vit_base_patch32_384"
     hidden_size = 768
     num_heads = 12
@@ -50,7 +55,7 @@ def config():
     mlp_ratio = 4
     drop_rate = 0.1
 
-    # Optimizer Setting
+    # Optimizer setting
     optim_type = "adamw"
     learning_rate = 1e-4
     weight_decay = 0.01
@@ -59,21 +64,29 @@ def config():
     max_steps = 25000
     warmup_steps = 2500
     end_lr = 0
-    lr_mult = 1  # multiply lr for downstream heads
+    lr_mult = 1
 
-    # Downstream Setting
+    # Change detection setting
+    s2_scale_div = 10000.0
+    change_loss_weight = 1.0
+    change_global_loss_weight = 0.20
+    change_smoothness_loss_weight = 0.05
+    change_pos_quantile = 0.90
+    change_neg_quantile = 0.35
+
+    # Downstream setting
     get_recall_metric = False
 
-    # PL Trainer Setting
+    # PL trainer setting
     resume_from = None
     fast_dev_run = False
     val_check_interval = 1.0
     test_only = False
 
-    # below params varies with the environment
+    # Environment-dependent params
     data_root = ""
     log_dir = "result"
-    per_gpu_batchsize = 0  # you should define this manually with per_gpu_batch_size=#
+    per_gpu_batchsize = 0
     num_gpus = 1
     num_nodes = 1
     load_path = ""
@@ -83,7 +96,6 @@ def config():
     json = "/home/amax/wyj/dataset/RSITMD/dataset_RSITMD.json"
 
 
-# Named configs for "environment" which define gpus and nodes, and paths
 @ex.named_config
 def env_dandelin():
     data_root = "/data2/dsets/dataset"
@@ -92,7 +104,6 @@ def env_dandelin():
     num_nodes = 1
 
 
-# Named configs for "task" which define datasets, loss_names and desired batch_size, warmup_steps, epochs, and exp_name
 @ex.named_config
 def task_mlm_itm():
     exp_name = "mlm_itm"
@@ -239,6 +250,7 @@ def task_finetune_irtr_f30k_randaug():
     draw_false_text = 15
     learning_rate = 1e-4
 
+
 @ex.named_config
 def task_finetune_irtr_sydney_randaug():
     exp_name = "finetune_irtr_sydney_randaug"
@@ -301,7 +313,6 @@ def task_finetune_irtr_rsitmd_randaug():
     draw_false_text = 15
     learning_rate = 1e-4
     json = "/home/amax/wyj/dataset/RSITMD/dataset_RSITMD.json"
-# Named configs for "etc" which are orthogonal to "env" and "task", need to be added at the end
 
 
 @ex.named_config
@@ -335,3 +346,94 @@ def vit32_base():
     hidden_size = 768
     num_heads = 12
     num_layers = 12
+
+
+@ex.named_config
+def task_smoke_s2_npz():
+    exp_name = "smoke_s2_npz"
+    datasets = ["s2_npz"]
+    data_root = "data_npz"
+
+    per_gpu_batchsize = 1
+    batch_size = 1
+    num_workers = 0
+    num_gpus = 1
+    num_nodes = 1
+
+    max_epoch = 1
+    max_steps = 5
+    warmup_steps = 0
+    get_recall_metric = False
+
+    load_path = "weights/vilt_200k_mlm_itm.ckpt"
+
+    image_size = 384
+    vit = "vit_base_patch32_384"
+    patch_size = 32
+
+    train_transform_keys = ["pixelbert_randaug"]
+    val_transform_keys = ["pixelbert"]
+@ex.named_config
+def task_finetune_s2_npz_irtr_osm():
+    exp_name = "finetune_irtr_rsicd_randaug"
+    datasets = ["s2_npz"]
+    data_root = "data_npz"
+
+    loss_names = _loss_names({"irtr": 1})
+    get_recall_metric = False
+
+    per_gpu_batchsize = 1
+    batch_size = 1
+    num_workers = 0
+    num_gpus = 1
+    num_nodes = 1
+
+    max_epoch = 20
+    max_steps = 5000
+    warmup_steps = 0
+
+    draw_false_image = 1
+    draw_false_text = 2
+
+    image_size = 384
+    vit = "vit_base_patch32_384"
+    patch_size = 32
+    train_transform_keys = ["pixelbert_randaug"]
+    val_transform_keys = ["pixelbert"]
+
+    max_text_len = 40
+@ex.named_config
+def task_s2_npz_irtr_v14():
+    exp_name = "finetune_irtr_rsicd_randaug"
+    datasets = ["s2_npz"]
+
+    train_transform_keys = ["pixelbert_randaug"]
+    val_transform_keys = ["pixelbert"]
+
+    loss_names = _loss_names({"irtr": 1})
+
+    data_root = "data_npz"
+
+    per_gpu_batchsize = 1
+    batch_size = 1
+    num_workers = 0
+    num_gpus = 1
+    num_nodes = 1
+
+    max_epoch = 1
+    max_steps = 100
+    warmup_steps = 0
+
+    get_recall_metric = False
+    draw_false_text = 2
+
+    image_size = 384
+    vit = "vit_base_patch32_384"
+    patch_size = 32
+
+    max_text_len = 40
+    osm_text_mode = "first"
+    osm_max_phrases = 1
+
+    change_loss_weight = 1.0
+    
