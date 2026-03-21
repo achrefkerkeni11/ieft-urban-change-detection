@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.env
+.venv/
+venv/
+env/
+conda_envs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# PyTorch / checkpoints / training outputs
+*.ckpt
+*.pth
+*.pt
+result/
+outputs/
+lightning_logs/
+wandb/
+
+# Large data folders
+data_npz/
+data_osm/raw/
+datasets/
+checkpoints/
+
+# Temporary files
+temp/
+tmp/
