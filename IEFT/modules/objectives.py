@@ -237,17 +237,38 @@ def compute_irtr(pl_module, batch):
 
 # ===================== Change detection (pseudo-supervised bootstrap) =====================
 
-def _robust_minmax_per_image(x: torch.Tensor, q_low: float = 0.05, q_high: float = 0.95, eps: float = 1e-6):
+def _robust_minmax_per_image(x: torch.Tensor, q_low: float = 0.02, q_high: float = 0.98, eps: float = 1e-6):
     """
-    x: [B,1,H,W]
-    robust min-max normalization per image using quantiles.
+    Normalisation robuste image par image avec quantiles.
+    Important: torch.quantile exige un tenseur float/double.
     """
-    b = x.size(0)
-    flat = x.flatten(1)
+    if x is None:
+        return x
+
+    x = x.float()
+
+    if x.dim() == 3:
+        x = x.unsqueeze(1)
+
+    if x.dim() != 4:
+        raise ValueError(f"_robust_minmax_per_image attend [B,C,H,W] ou [B,H,W], reçu shape={tuple(x.shape)}")
+
+    b = x.shape[0]
+    flat = x.contiguous().view(b, -1).float()
+
     lo = torch.quantile(flat, q_low, dim=1, keepdim=True).view(b, 1, 1, 1)
     hi = torch.quantile(flat, q_high, dim=1, keepdim=True).view(b, 1, 1, 1)
-    x = (x - lo) / (hi - lo + eps)
-    return x.clamp(0.0, 1.0)
+
+    out = (x - lo) / (hi - lo + eps)
+    out = out.clamp(0.0, 1.0)
+    return out
+
+def _gradient_magnitude(x: torch.Tensor) -> torch.Tensor:
+    sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=x.dtype, device=x.device)
+    sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=x.dtype, device=x.device)
+    gx = F.conv2d(x, sobel_x, padding=1)
+    gy = F.conv2d(x, sobel_y, padding=1)
+    return torch.sqrt(gx * gx + gy * gy + 1e-6)
 
 
 def _compute_patchwise_change_pseudo_labels(
@@ -259,48 +280,27 @@ def _compute_patchwise_change_pseudo_labels(
     ndvi_eps: float = 1e-6,
 ):
     """
-    Robust pseudo-label generation from raw 8-band Sentinel-2 tensor.
+    Pseudo-labels plus stables à partir de plusieurs indices spectraux / texturels.
 
-    Input:
-      x8: [B, 8, H, W]
-      bands:
-        T1_B2, T1_B3, T1_B4, T1_B8,
-        T2_B2, T2_B3, T2_B4, T2_B8
-
-    Strategy:
-      1) normalize Sentinel-2 values
-      2) build three change cues:
-         - mean absolute multi-band difference
-         - visible RGB difference
-         - NDVI difference
-      3) combine them
-      4) robust per-image normalization
-      5) pool to patch grid
-      6) build confident positives / negatives via quantiles
-         middle band remains uncertain
-
-    Returns:
-      pseudo_labels   : [B, G*G] float in {0,1}
-      pooled_scores   : [B, G*G] float in [0,1]
-      confident_mask  : [B, G*G] float in {0,1}
+    Retourne:
+      pseudo_labels  : [B, G*G] binaire
+      pooled_scores  : [B, G*G] score continu
+      confident_mask : [B, G*G] masque des patches fiables
     """
     if x8 is None:
         raise ValueError("x8 is required to build pseudo change labels")
 
     x8 = x8.float() / float(s2_scale_div)
 
-    t1 = x8[:, :4]   # B2,B3,B4,B8
-    t2 = x8[:, 4:]   # B2,B3,B4,B8
+    t1 = x8[:, :4]
+    t2 = x8[:, 4:]
 
-    # 1) multi-band absolute difference
-    diff_all = torch.abs(t2 - t1).mean(dim=1, keepdim=True)  # [B,1,H,W]
+    diff_all = torch.abs(t2 - t1).mean(dim=1, keepdim=True)
 
-    # 2) visible RGB difference
     rgb_t1 = t1[:, :3]
     rgb_t2 = t2[:, :3]
-    diff_rgb = torch.abs(rgb_t2 - rgb_t1).mean(dim=1, keepdim=True)  # [B,1,H,W]
+    diff_rgb = torch.abs(rgb_t2 - rgb_t1).mean(dim=1, keepdim=True)
 
-    # 3) NDVI difference
     red_t1 = t1[:, 2:3]
     nir_t1 = t1[:, 3:4]
     red_t2 = t2[:, 2:3]
@@ -308,19 +308,36 @@ def _compute_patchwise_change_pseudo_labels(
 
     ndvi_t1 = (nir_t1 - red_t1) / (nir_t1 + red_t1 + ndvi_eps)
     ndvi_t2 = (nir_t2 - red_t2) / (nir_t2 + red_t2 + ndvi_eps)
-    diff_ndvi = torch.abs(ndvi_t2 - ndvi_t1)  # [B,1,H,W]
+    diff_ndvi = torch.abs(ndvi_t2 - ndvi_t1)
 
-    # Robust normalization per cue
-    diff_all = _robust_minmax_per_image(diff_all)
-    diff_rgb = _robust_minmax_per_image(diff_rgb)
-    diff_ndvi = _robust_minmax_per_image(diff_ndvi)
+    diff_nir = torch.abs(nir_t2 - nir_t1)
 
-    # Weighted fusion of cues
-    score = 0.50 * diff_all + 0.30 * diff_rgb + 0.20 * diff_ndvi
+    edge_t1 = _gradient_magnitude(rgb_t1.mean(dim=1, keepdim=True))
+    edge_t2 = _gradient_magnitude(rgb_t2.mean(dim=1, keepdim=True))
+    diff_edge = torch.abs(edge_t2 - edge_t1)
+
+    hp_all = diff_all - F.avg_pool2d(diff_all, kernel_size=3, stride=1, padding=1)
+    hp_all = torch.abs(hp_all)
+
+    diff_all = _robust_minmax_per_image(diff_all.float())
+    diff_rgb = _robust_minmax_per_image(diff_rgb.float())
+    diff_ndvi = _robust_minmax_per_image(diff_ndvi.float())
+    diff_nir = _robust_minmax_per_image(diff_nir.float())
+    diff_edge = _robust_minmax_per_image(diff_edge.float())
+    hp_all = _robust_minmax_per_image(hp_all.float())
+
+    score = (
+        0.28 * diff_all
+        + 0.18 * diff_rgb
+        + 0.18 * diff_ndvi
+        + 0.14 * diff_nir
+        + 0.12 * diff_edge
+        + 0.10 * hp_all
+    )
     score = _robust_minmax_per_image(score)
 
-    pooled = F.adaptive_avg_pool2d(score, (grid_size, grid_size)).squeeze(1)  # [B,G,G]
-    pooled_flat = pooled.flatten(1)  # [B,G*G]
+    pooled = F.adaptive_avg_pool2d(score, (grid_size, grid_size)).squeeze(1)
+    pooled_flat = pooled.flatten(1)
 
     pos_thr = torch.quantile(pooled_flat, pos_quantile, dim=1, keepdim=True)
     neg_thr = torch.quantile(pooled_flat, neg_quantile, dim=1, keepdim=True)
@@ -330,43 +347,154 @@ def _compute_patchwise_change_pseudo_labels(
 
     return pseudo_labels, pooled_flat, confident_mask
 
-def _spatial_smoothness_loss_from_logits(change_logits: torch.Tensor) -> torch.Tensor:
-    """
-    Encourage neighboring patch predictions to vary smoothly.
 
-    change_logits: [B, N] where N = G*G
-    Returns a scalar smoothness loss.
-    """
+def _compute_dense_change_pseudo_labels(
+    x8: torch.Tensor,
+    s2_scale_div: float = 10000.0,
+    pos_quantile: float = 0.80,
+    neg_quantile: float = 0.45,
+    ndvi_eps: float = 1e-6,
+):
+    x8 = x8.float() / float(s2_scale_div)
+    t1 = x8[:, :4]
+    t2 = x8[:, 4:]
+
+    diff_all = torch.abs(t2 - t1).mean(dim=1, keepdim=True)
+    rgb_t1 = t1[:, :3]
+    rgb_t2 = t2[:, :3]
+    diff_rgb = torch.abs(rgb_t2 - rgb_t1).mean(dim=1, keepdim=True)
+
+    red_t1 = t1[:, 2:3]
+    nir_t1 = t1[:, 3:4]
+    red_t2 = t2[:, 2:3]
+    nir_t2 = t2[:, 3:4]
+    ndvi_t1 = (nir_t1 - red_t1) / (nir_t1 + red_t1 + ndvi_eps)
+    ndvi_t2 = (nir_t2 - red_t2) / (nir_t2 + red_t2 + ndvi_eps)
+    diff_ndvi = torch.abs(ndvi_t2 - ndvi_t1)
+    diff_nir = torch.abs(nir_t2 - nir_t1)
+
+    edge_t1 = _gradient_magnitude(rgb_t1.mean(dim=1, keepdim=True))
+    edge_t2 = _gradient_magnitude(rgb_t2.mean(dim=1, keepdim=True))
+    diff_edge = torch.abs(edge_t2 - edge_t1)
+    hp_all = torch.abs(diff_all - F.avg_pool2d(diff_all, kernel_size=3, stride=1, padding=1))
+
+    diff_all = _robust_minmax_per_image(diff_all.float())
+    diff_rgb = _robust_minmax_per_image(diff_rgb.float())
+    diff_ndvi = _robust_minmax_per_image(diff_ndvi.float())
+    diff_nir = _robust_minmax_per_image(diff_nir.float())
+    diff_edge = _robust_minmax_per_image(diff_edge.float())
+    hp_all = _robust_minmax_per_image(hp_all.float())
+
+    score = (
+        0.28 * diff_all
+        + 0.18 * diff_rgb
+        + 0.18 * diff_ndvi
+        + 0.14 * diff_nir
+        + 0.12 * diff_edge
+        + 0.10 * hp_all
+    )
+    score = _robust_minmax_per_image(score)
+
+    b = score.shape[0]
+    flat = score.view(b, -1)
+    pos_thr = torch.quantile(flat, pos_quantile, dim=1, keepdim=True).view(b, 1, 1, 1)
+    neg_thr = torch.quantile(flat, neg_quantile, dim=1, keepdim=True).view(b, 1, 1, 1)
+
+    pseudo_dense = (score >= pos_thr).float()
+    confident_dense = ((score >= pos_thr) | (score <= neg_thr)).float()
+    return pseudo_dense, score, confident_dense
+
+
+def _spatial_smoothness_loss_from_map(logits_2d: torch.Tensor) -> torch.Tensor:
+    if logits_2d is None:
+        return torch.tensor(0.0)
+    x = logits_2d.float()
+    dh = torch.abs(x[:, 1:, :] - x[:, :-1, :]).mean()
+    dw = torch.abs(x[:, :, 1:] - x[:, :, :-1]).mean()
+    return dh + dw
+
+
+def _dense_boundary_target(mask_2d: torch.Tensor) -> torch.Tensor:
+    edge = _gradient_magnitude(mask_2d.float())
+    edge = _robust_minmax_per_image(edge.float())
+    return (edge > 0.10).float()
+
+
+def _spatial_smoothness_loss_from_logits(change_logits: torch.Tensor) -> torch.Tensor:
     b, n = change_logits.shape
     g = int(n ** 0.5)
     if g * g != n:
         raise ValueError(f"Expected square grid, got N={n}")
-
     x = change_logits.view(b, g, g)
-
     dh = torch.abs(x[:, 1:, :] - x[:, :-1, :]).mean()
     dw = torch.abs(x[:, :, 1:] - x[:, :, :-1]).mean()
-
     return dh + dw
+
+
+def _masked_bce_with_logits(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, pos_weight: torch.Tensor = None) -> torch.Tensor:
+    if logits is None:
+        return torch.tensor(0.0, device=targets.device)
+
+    logits = logits.float()
+    targets = targets.float()
+    mask = mask.float()
+
+    loss_map = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pos_weight)
+    denom = mask.sum().clamp_min(1.0)
+    return (loss_map * mask).sum() / denom
+
+
+def _masked_soft_dice_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.sigmoid(logits).float()
+    targets = targets.float()
+    mask = mask.float()
+
+    probs = probs * mask
+    targets = targets * mask
+
+    inter = (probs * targets).sum(dim=1)
+    denom = probs.sum(dim=1) + targets.sum(dim=1)
+    valid = (mask.sum(dim=1) > 0).float()
+    dice = (2.0 * inter + eps) / (denom + eps)
+    return ((1.0 - dice) * valid).sum() / valid.sum().clamp_min(1.0)
+
+
+def _masked_focal_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits).float()
+    targets = targets.float()
+    mask = mask.float()
+
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    pt = probs * targets + (1.0 - probs) * (1.0 - targets)
+    alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
+    loss = alpha_t * torch.pow(1.0 - pt, gamma) * bce
+
+    denom = mask.sum().clamp_min(1.0)
+    return (loss * mask).sum() / denom
+
+
 def compute_change_pseudo(pl_module, batch):
     """
-    Improved pseudo change supervision with stricter quantiles
-    + lightweight spatial smoothness regularization.
-
-    Effects expected:
-    - fewer pseudo positives
-    - less collapse to all-black or all-white outputs
-    - more spatially coherent predicted change maps
+    Supervision coarse-to-fine :
+    - loss coarse au niveau patch
+    - loss refined au niveau dense si la refine head est présente
+    - loss frontière dense
+    - losses globales / OSM structurées
     """
     if "x8" not in batch:
         return {}
 
     infer = pl_module.infer(batch, mask_text=False, mask_image=False)
-
     if infer["change_logits"] is None:
         return {}
 
-    pred_logits = infer["change_logits"]  # [B, N]
+    pred_logits = infer["change_logits"]
     pred_probs = torch.sigmoid(pred_logits)
 
     b, n = pred_logits.shape
@@ -378,52 +506,113 @@ def compute_change_pseudo(pl_module, batch):
         batch["x8"].to(pred_logits.device),
         grid_size=g,
         s2_scale_div=pl_module.hparams.config.get("s2_scale_div", 10000.0),
-        pos_quantile=float(pl_module.hparams.config.get("change_pos_quantile", 0.90)),
-        neg_quantile=float(pl_module.hparams.config.get("change_neg_quantile", 0.35)),
+        pos_quantile=float(pl_module.hparams.config.get("change_pos_quantile", 0.80)),
+        neg_quantile=float(pl_module.hparams.config.get("change_neg_quantile", 0.45)),
     )
 
     pseudo_labels = pseudo_labels.to(pred_logits.device)
     pseudo_scores = pseudo_scores.to(pred_logits.device)
     confident_mask = confident_mask.to(pred_logits.device)
 
-    # Patch classification loss
-    loss_map = F.binary_cross_entropy_with_logits(
-        pred_logits,
-        pseudo_labels,
-        reduction="none",
-    )
-
-    # Reweight positives on confident patches only
     pos_count = (pseudo_labels * confident_mask).sum(dim=1)
     neg_count = ((1.0 - pseudo_labels) * confident_mask).sum(dim=1)
-    pos_weight = (neg_count + 1.0) / (pos_count + 1.0)
+    pos_weight = ((neg_count + 1.0) / (pos_count + 1.0)).mean().detach().clamp_min(1.0)
+    pos_weight_t = torch.tensor([float(pos_weight)], device=pred_logits.device)
 
-    weight_map = confident_mask.clone()
-    weight_map = weight_map + confident_mask * pseudo_labels * (pos_weight.unsqueeze(1) - 1.0)
+    coarse_bce = _masked_bce_with_logits(pred_logits, pseudo_labels, confident_mask, pos_weight=pos_weight_t)
+    coarse_dice = _masked_soft_dice_loss(pred_logits, pseudo_labels, confident_mask)
+    coarse_focal = _masked_focal_with_logits(pred_logits, pseudo_labels, confident_mask, alpha=0.25, gamma=2.0)
+    coarse_smooth = _spatial_smoothness_loss_from_logits(pred_logits)
 
-    denom = weight_map.sum().clamp_min(1.0)
-    patch_loss = (loss_map * weight_map).sum() / denom
+    coarse_patch_loss = (
+        float(pl_module.hparams.config.get("change_bce_loss_weight", 0.50)) * coarse_bce
+        + float(pl_module.hparams.config.get("change_dice_loss_weight", 0.30)) * coarse_dice
+        + float(pl_module.hparams.config.get("change_focal_loss_weight", 0.20)) * coarse_focal
+    )
 
-    # Global loss from TEMP branch
-    global_loss = torch.tensor(0.0, device=pred_logits.device)
-    if infer["change_global_logits"] is not None:
-        pseudo_global = (pseudo_labels.mean(dim=1) > 0.03).float()
-        global_loss = F.binary_cross_entropy_with_logits(
-            infer["change_global_logits"],
-            pseudo_global,
+    # ===== Dense refined supervision =====
+    refined_loss = torch.tensor(0.0, device=pred_logits.device)
+    refined_bce = torch.tensor(0.0, device=pred_logits.device)
+    refined_dice = torch.tensor(0.0, device=pred_logits.device)
+    refined_focal = torch.tensor(0.0, device=pred_logits.device)
+    refined_smooth = torch.tensor(0.0, device=pred_logits.device)
+    boundary_loss = torch.tensor(0.0, device=pred_logits.device)
+    pseudo_dense = None
+    confident_dense = None
+
+    refined_logits_up = infer.get("change_refined_logits_up", None)
+    boundary_logits_up = infer.get("change_boundary_logits_up", None)
+    if refined_logits_up is not None:
+        pseudo_dense, pseudo_dense_scores, confident_dense = _compute_dense_change_pseudo_labels(
+            batch["x8"].to(pred_logits.device),
+            s2_scale_div=pl_module.hparams.config.get("s2_scale_div", 10000.0),
+            pos_quantile=float(pl_module.hparams.config.get("change_pos_quantile", 0.80)),
+            neg_quantile=float(pl_module.hparams.config.get("change_neg_quantile", 0.45)),
+        )
+        pseudo_dense = pseudo_dense.to(pred_logits.device).squeeze(1)
+        confident_dense = confident_dense.to(pred_logits.device).squeeze(1)
+
+        dense_pos_count = (pseudo_dense * confident_dense).sum(dim=(1, 2))
+        dense_neg_count = ((1.0 - pseudo_dense) * confident_dense).sum(dim=(1, 2))
+        dense_pos_weight = ((dense_neg_count + 1.0) / (dense_pos_count + 1.0)).mean().detach().clamp_min(1.0)
+        dense_pos_weight_t = torch.tensor([float(dense_pos_weight)], device=pred_logits.device)
+
+        refined_bce = _masked_bce_with_logits(refined_logits_up, pseudo_dense, confident_dense, pos_weight=dense_pos_weight_t)
+        refined_dice = _masked_soft_dice_loss(refined_logits_up.view(b, -1), pseudo_dense.view(b, -1), confident_dense.view(b, -1))
+        refined_focal = _masked_focal_with_logits(refined_logits_up, pseudo_dense, confident_dense, alpha=0.25, gamma=2.0)
+        refined_smooth = _spatial_smoothness_loss_from_map(refined_logits_up)
+
+        refined_loss = (
+            float(pl_module.hparams.config.get("change_refined_bce_loss_weight", 0.45)) * refined_bce
+            + float(pl_module.hparams.config.get("change_refined_dice_loss_weight", 0.30)) * refined_dice
+            + float(pl_module.hparams.config.get("change_refined_focal_loss_weight", 0.25)) * refined_focal
+            + float(pl_module.hparams.config.get("change_refined_smoothness_loss_weight", 0.02)) * refined_smooth
         )
 
-    # Spatial smoothness loss on patch logits
-    # encourages neighboring patches to vary more smoothly
-    x = pred_logits.view(b, g, g)
-    dh = torch.abs(x[:, 1:, :] - x[:, :-1, :]).mean()
-    dw = torch.abs(x[:, :, 1:] - x[:, :, :-1]).mean()
-    smoothness_loss = dh + dw
+        if boundary_logits_up is not None:
+            boundary_target = _dense_boundary_target(pseudo_dense.unsqueeze(1)).squeeze(1)
+            boundary_mask = confident_dense
+            boundary_loss = _masked_bce_with_logits(boundary_logits_up, boundary_target, boundary_mask)
 
-    global_weight = float(pl_module.hparams.config.get("change_global_loss_weight", 0.20))
-    smoothness_weight = float(pl_module.hparams.config.get("change_smoothness_loss_weight", 0.05))
+    global_loss = torch.tensor(0.0, device=pred_logits.device)
+    if infer.get("change_global_logits") is not None:
+        pseudo_global = (pseudo_labels.mean(dim=1) > 0.03).float()
+        global_loss = F.binary_cross_entropy_with_logits(infer["change_global_logits"], pseudo_global)
 
-    total_loss = patch_loss + global_weight * global_loss + smoothness_weight * smoothness_loss
+    struct_patch_loss = torch.tensor(0.0, device=pred_logits.device)
+    struct_global_loss = torch.tensor(0.0, device=pred_logits.device)
+    has_osm = batch.get("has_osm_text", None)
+    if has_osm is not None:
+        has_osm = has_osm.to(pred_logits.device).float().view(b, 1)
+
+        if infer.get("change_struct_patch_logits") is not None:
+            struct_mask = confident_mask * has_osm
+            if struct_mask.sum() > 0:
+                struct_patch_loss = _masked_bce_with_logits(
+                    infer["change_struct_patch_logits"],
+                    pseudo_labels,
+                    struct_mask,
+                    pos_weight=pos_weight_t,
+                )
+
+        if infer.get("change_struct_global_logits") is not None:
+            pseudo_global = (pseudo_labels.mean(dim=1) > 0.03).float()
+            valid = has_osm.squeeze(1) > 0
+            if valid.any():
+                struct_global_loss = F.binary_cross_entropy_with_logits(
+                    infer["change_struct_global_logits"][valid],
+                    pseudo_global[valid],
+                )
+
+    total_loss = (
+        float(pl_module.hparams.config.get("change_coarse_loss_weight", 0.35)) * coarse_patch_loss
+        + float(pl_module.hparams.config.get("change_refined_loss_weight", 0.55)) * refined_loss
+        + float(pl_module.hparams.config.get("change_boundary_loss_weight", 0.10)) * boundary_loss
+        + float(pl_module.hparams.config.get("change_global_loss_weight", 0.15)) * global_loss
+        + float(pl_module.hparams.config.get("change_smoothness_loss_weight", 0.03)) * coarse_smooth
+        + float(pl_module.hparams.config.get("osm_struct_patch_loss_weight", 0.05)) * struct_patch_loss
+        + float(pl_module.hparams.config.get("osm_struct_global_loss_weight", 0.10)) * struct_global_loss
+    )
     total_loss = total_loss * float(pl_module.hparams.config.get("change_loss_weight", 1.0))
 
     preds_bin = (pred_probs > 0.5).float()
@@ -437,9 +626,20 @@ def compute_change_pseudo(pl_module, batch):
 
     ret = {
         "change_pseudo_loss": total_loss,
-        "change_patch_loss": patch_loss.detach(),
+        "change_patch_loss": coarse_patch_loss.detach(),
+        "change_bce_loss": coarse_bce.detach(),
+        "change_dice_loss": coarse_dice.detach(),
+        "change_focal_loss": coarse_focal.detach(),
         "change_global_loss": global_loss.detach(),
-        "change_smoothness_loss": smoothness_loss.detach(),
+        "change_struct_patch_loss": struct_patch_loss.detach(),
+        "change_struct_global_loss": struct_global_loss.detach(),
+        "change_smoothness_loss": coarse_smooth.detach(),
+        "change_refined_loss": refined_loss.detach(),
+        "change_refined_bce_loss": refined_bce.detach(),
+        "change_refined_dice_loss": refined_dice.detach(),
+        "change_refined_focal_loss": refined_focal.detach(),
+        "change_refined_smoothness_loss": refined_smooth.detach(),
+        "change_boundary_loss": boundary_loss.detach(),
         "change_logits": pred_logits,
         "change_probs": pred_probs,
         "change_pseudo_labels": pseudo_labels,
@@ -449,17 +649,25 @@ def compute_change_pseudo(pl_module, batch):
 
     phase = "train" if pl_module.training else "val"
     pl_module.log(f"change/{phase}/pseudo_loss", total_loss)
-    pl_module.log(f"change/{phase}/patch_loss", patch_loss)
+    pl_module.log(f"change/{phase}/patch_loss", coarse_patch_loss)
+    pl_module.log(f"change/{phase}/bce_loss", coarse_bce)
+    pl_module.log(f"change/{phase}/dice_loss", coarse_dice)
+    pl_module.log(f"change/{phase}/focal_loss", coarse_focal)
+    pl_module.log(f"change/{phase}/refined_loss", refined_loss)
+    pl_module.log(f"change/{phase}/refined_bce_loss", refined_bce)
+    pl_module.log(f"change/{phase}/refined_dice_loss", refined_dice)
+    pl_module.log(f"change/{phase}/refined_focal_loss", refined_focal)
+    pl_module.log(f"change/{phase}/boundary_loss", boundary_loss)
     pl_module.log(f"change/{phase}/global_loss", global_loss)
-    pl_module.log(f"change/{phase}/smoothness_loss", smoothness_loss)
+    pl_module.log(f"change/{phase}/struct_patch_loss", struct_patch_loss)
+    pl_module.log(f"change/{phase}/struct_global_loss", struct_global_loss)
+    pl_module.log(f"change/{phase}/smoothness_loss", coarse_smooth)
     pl_module.log(f"change/{phase}/confident_acc", confident_acc)
     pl_module.log(f"change/{phase}/pred_positive_rate", pred_positive_rate)
     pl_module.log(f"change/{phase}/pseudo_positive_rate", pseudo_positive_rate)
     pl_module.log(f"change/{phase}/confident_rate", confident_rate)
 
     return ret
-
-
 def tr_top_k(img_idx, relate, idx, k):
     text_idx = idx[:, :k]
     batch, _ = text_idx.shape

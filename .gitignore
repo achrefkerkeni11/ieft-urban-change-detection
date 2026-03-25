@@ -36,10 +36,22 @@ wandb/
 
 # Large data folders
 data_npz/
-data_osm/raw/
 datasets/
 checkpoints/
-
+data_osm/
 # Temporary files
 temp/
 tmp/
+data_osm/
+models/
+.hf_home/
+data_raw/
+features/
+dummy_data/
+outputs/
+result/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.pyo
+*.pyd

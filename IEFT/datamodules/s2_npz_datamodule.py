@@ -21,6 +21,9 @@ class S2NPZDataModule:
       data_root/train/*.npz
       data_root/val/*.npz
       data_root/test/*.npz
+
+    Cette version expose proprement les nouveaux paramètres OSM
+    pour corriger l'exploitation des JSON riches (v19/v20/v21).
     """
 
     def __init__(self, _config, dist: bool = False):
@@ -40,6 +43,13 @@ class S2NPZDataModule:
         self.osm_texts_json = str(self.config.get("osm_texts_json", "")).strip()
         self.osm_text_mode = str(self.config.get("osm_text_mode", "concat")).strip().lower()
         self.osm_max_phrases = int(self.config.get("osm_max_phrases", 3))
+
+        self.osm_text_key = str(self.config.get("osm_text_key", "text_v12")).strip() or "text_v12"
+        self.osm_fallback_text = str(self.config.get("osm_fallback_text", "no_osm_context")).strip()
+        self.osm_compose_mode = str(self.config.get("osm_compose_mode", "signature_compact")).strip().lower()
+        self.osm_word_budget = int(self.config.get("osm_word_budget", 32))
+        self.osm_joiner = str(self.config.get("osm_joiner", " ; "))
+        self.osm_include_source_text = bool(self.config.get("osm_include_source_text", False))
 
         tok_name = self.config.get("tokenizer", "bert-base-uncased")
         self.tokenizer = AutoTokenizer.from_pretrained(tok_name)
@@ -77,6 +87,12 @@ class S2NPZDataModule:
             osm_texts_json=self.osm_texts_json,
             osm_text_mode=self.osm_text_mode,
             osm_max_phrases=self.osm_max_phrases,
+            osm_text_key=self.osm_text_key,
+            osm_fallback_text=self.osm_fallback_text,
+            osm_compose_mode=self.osm_compose_mode,
+            osm_word_budget=self.osm_word_budget,
+            osm_joiner=self.osm_joiner,
+            osm_include_source_text=self.osm_include_source_text,
         )
 
     def setup(self, stage: Optional[str] = None):

@@ -1,45 +1,13 @@
 import time
+from IEFT.modules.light_multiscale_change_decoder import LightMultiScaleChangeDecoder
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
 import pytorch_lightning as pl
 
-from IEFT.modules.light_multiscale_change_decoder import LightMultiScaleChangeDecoder
 import IEFT.modules.vision_transformer as vit
 from .utils import localTransformer
 from transformers.models.bert.modeling_bert import BertConfig, BertEmbeddings
 from IEFT.modules import heads, objectives, vilt_utils
-
-
-class ConvGNAct2d(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, groups=8, act=True):
-        super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False)
-        g = 1
-        for cand in [8, 4, 2, 1]:
-            if out_ch % cand == 0 and cand <= groups:
-                g = cand
-                break
-        self.norm = nn.GroupNorm(num_groups=g, num_channels=out_ch)
-        self.act = nn.GELU() if act else nn.Identity()
-
-    def forward(self, x):
-        return self.act(self.norm(self.conv(x)))
-
-
-class ResidualRefineBlock(nn.Module):
-    def __init__(self, ch, dropout=0.0):
-        super().__init__()
-        self.block = nn.Sequential(
-            ConvGNAct2d(ch, ch, k=3, s=1, p=1),
-            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-            ConvGNAct2d(ch, ch, k=3, s=1, p=1, act=False),
-        )
-        self.act = nn.GELU()
-
-    def forward(self, x):
-        return self.act(x + self.block(x))
-
 
 
 class ViLTransformerSS(pl.LightningModule):
@@ -140,7 +108,7 @@ class ViLTransformerSS(pl.LightningModule):
                 p.requires_grad = False
 
         # ===================== Change Detection Heads ===================== #
-        # Legacy MLP head
+        # Legacy MLP head (fallback / ablation)
         self.change_head = nn.Sequential(
             nn.Linear(hs * 4, hs),
             nn.LayerNorm(hs),
@@ -158,10 +126,16 @@ class ViLTransformerSS(pl.LightningModule):
         )
         self.change_global_head.apply(objectives.init_weights)
 
-        # Multi-scale decoder activé en dur pour éviter les erreurs Sacred
-        self.use_multiscale_change_decoder = True
-        self.multiscale_decoder_dim = 256
-        self.multiscale_decoder_dropout = 0.1
+        # New light multi-scale decoder
+        self.use_multiscale_change_decoder = bool(
+            self.hparams.config.get("use_multiscale_change_decoder", False)
+        )
+        self.multiscale_decoder_dim = int(
+            self.hparams.config.get("multiscale_decoder_dim", 256)
+        )
+        self.multiscale_decoder_dropout = float(
+            self.hparams.config.get("multiscale_decoder_dropout", 0.1)
+        )
 
         self.change_decoder = LightMultiScaleChangeDecoder(
             in_dim=hs * 4,
@@ -169,79 +143,6 @@ class ViLTransformerSS(pl.LightningModule):
             dropout=self.multiscale_decoder_dropout,
         )
         self.change_decoder.apply(objectives.init_weights)
-
-        # Nouvelle branche de détail local (sans TEMP)
-        self.change_detail_head = nn.Sequential(
-            nn.Linear(hs * 3, hs),
-            nn.LayerNorm(hs),
-            nn.GELU(),
-            nn.Linear(hs, 1),
-        )
-        self.change_detail_head.apply(objectives.init_weights)
-
-        # Fusion fixe pour éviter les soucis Sacred
-        # legacy = détail local principal
-        # multiscale = cohérence spatiale
-        # detail = correction locale supplémentaire
-        self.change_fusion_alpha = 0.70
-        self.change_fusion_beta = 0.20
-        self.change_fusion_gamma = 0.10
-
-        # ===================== Structured OSM guidance ===================== #
-        self.use_structured_osm = bool(self.hparams.config.get("use_structured_osm", True))
-        self.osm_struct_dim = int(self.hparams.config.get("osm_struct_dim", 16))
-        self.osm_struct_patch_weight = float(self.hparams.config.get("osm_struct_patch_weight", 0.20))
-        self.osm_struct_global_weight = float(self.hparams.config.get("osm_struct_global_weight", 0.35))
-
-        self.osm_struct_proj = nn.Sequential(
-            nn.Linear(self.osm_struct_dim, hs),
-            nn.LayerNorm(hs),
-            nn.GELU(),
-            nn.Linear(hs, hs),
-        )
-        self.osm_struct_proj.apply(objectives.init_weights)
-
-        self.osm_struct_patch_head = nn.Sequential(
-            nn.Linear(hs * 3, hs),
-            nn.LayerNorm(hs),
-            nn.GELU(),
-            nn.Linear(hs, 1),
-        )
-        self.osm_struct_patch_head.apply(objectives.init_weights)
-
-        self.osm_struct_global_head = nn.Sequential(
-            nn.Linear(hs * 3, hs),
-            nn.LayerNorm(hs),
-            nn.GELU(),
-            nn.Linear(hs, 1),
-        )
-        self.osm_struct_global_head.apply(objectives.init_weights)
-
-
-        # ===================== Coarse-to-fine refine head ===================== #
-        self.use_refine_change_head = True
-        self.change_refine_hidden = int(self.hparams.config.get("change_refine_hidden", 64))
-        self.change_refine_dropout = float(self.hparams.config.get("change_refine_dropout", 0.10))
-        self.change_refine_coarse_weight = float(self.hparams.config.get("change_refine_coarse_weight", 0.25))
-        self.change_boundary_weight = float(self.hparams.config.get("change_boundary_weight", 0.15))
-
-        refine_in_ch = 7  # coarse logit + diff_all + diff_rgb + diff_ndvi + diff_nir + diff_edge + hp_all
-        self.change_refine_net = nn.Sequential(
-            ConvGNAct2d(refine_in_ch, self.change_refine_hidden, k=3, s=1, p=1),
-            ResidualRefineBlock(self.change_refine_hidden, dropout=self.change_refine_dropout),
-            ResidualRefineBlock(self.change_refine_hidden, dropout=self.change_refine_dropout),
-            ResidualRefineBlock(self.change_refine_hidden, dropout=self.change_refine_dropout),
-        )
-        self.change_refine_net.apply(objectives.init_weights)
-
-        self.change_refine_head = nn.Conv2d(self.change_refine_hidden, 1, kernel_size=1)
-        self.change_refine_head.apply(objectives.init_weights)
-
-        self.change_boundary_head = nn.Sequential(
-            ConvGNAct2d(self.change_refine_hidden, self.change_refine_hidden, k=3, s=1, p=1),
-            nn.Conv2d(self.change_refine_hidden, 1, kernel_size=1),
-        )
-        self.change_boundary_head.apply(objectives.init_weights)
 
         # ===================== Load checkpoint flexibly ===================== #
         if self.hparams.config["load_path"] != "":
@@ -259,6 +160,7 @@ class ViLTransformerSS(pl.LightningModule):
         """
         ckpt = torch.load(ckpt_path, map_location="cpu")
         state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+
         state_dict = dict(state_dict)
 
         tt_key = "token_type_embeddings.weight"
@@ -291,127 +193,6 @@ class ViLTransformerSS(pl.LightningModule):
         if mask.dtype in (torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8):
             return mask
         return (mask > 0).long()
-
-    def _masked_mean_pool(self, feats: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        masks = self._ensure_long_mask(masks)
-        if masks is None:
-            return feats.mean(dim=1)
-        mask = masks.float()
-        denom = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return (feats * mask.unsqueeze(-1)).sum(dim=1) / denom
-
-    def _get_osm_struct(self, batch, device, batch_size: int):
-        if "osm_struct" not in batch:
-            struct = torch.zeros(batch_size, self.osm_struct_dim, device=device)
-        else:
-            struct = batch["osm_struct"].to(device).float()
-            if struct.dim() == 1:
-                struct = struct.unsqueeze(0)
-            if struct.size(1) < self.osm_struct_dim:
-                pad = torch.zeros(struct.size(0), self.osm_struct_dim - struct.size(1), device=device)
-                struct = torch.cat([struct, pad], dim=1)
-            elif struct.size(1) > self.osm_struct_dim:
-                struct = struct[:, : self.osm_struct_dim]
-
-        if "has_osm_text" in batch:
-            has_osm = batch["has_osm_text"].to(device).float().view(batch_size, 1)
-        else:
-            has_osm = torch.zeros(batch_size, 1, device=device)
-        return struct, has_osm
-
-
-    @staticmethod
-    def _robust_norm_map(x: torch.Tensor, q_low: float = 0.02, q_high: float = 0.98, eps: float = 1e-6):
-        x = x.float()
-        b = x.shape[0]
-        flat = x.view(b, -1)
-        lo = torch.quantile(flat, q_low, dim=1, keepdim=True).view(b, 1, 1, 1)
-        hi = torch.quantile(flat, q_high, dim=1, keepdim=True).view(b, 1, 1, 1)
-        return ((x - lo) / (hi - lo + eps)).clamp(0.0, 1.0)
-
-    @staticmethod
-    def _gradient_magnitude_2d(x: torch.Tensor):
-        x = x.float()
-        if x.dim() == 3:
-            x = x.unsqueeze(1)
-        sobel_x = torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=x.dtype, device=x.device)
-        sobel_y = torch.tensor([[[[-1, -2, -1], [0, 0, 0], [1, 2, 1]]]], dtype=x.dtype, device=x.device)
-        gx = F.conv2d(x, sobel_x, padding=1)
-        gy = F.conv2d(x, sobel_y, padding=1)
-        return torch.sqrt(gx * gx + gy * gy + 1e-6)
-
-    def _build_refine_inputs(self, batch, coarse_logits_2d: torch.Tensor):
-        if "x8" not in batch:
-            return None
-
-        x8 = batch["x8"].to(coarse_logits_2d.device).float() / float(self.hparams.config.get("s2_scale_div", 10000.0))
-        t1 = x8[:, :4]
-        t2 = x8[:, 4:]
-
-        diff_all = torch.abs(t2 - t1).mean(dim=1, keepdim=True)
-        rgb_t1 = t1[:, :3]
-        rgb_t2 = t2[:, :3]
-        diff_rgb = torch.abs(rgb_t2 - rgb_t1).mean(dim=1, keepdim=True)
-
-        red_t1 = t1[:, 2:3]
-        nir_t1 = t1[:, 3:4]
-        red_t2 = t2[:, 2:3]
-        nir_t2 = t2[:, 3:4]
-        ndvi_t1 = (nir_t1 - red_t1) / (nir_t1 + red_t1 + 1e-6)
-        ndvi_t2 = (nir_t2 - red_t2) / (nir_t2 + red_t2 + 1e-6)
-        diff_ndvi = torch.abs(ndvi_t2 - ndvi_t1)
-        diff_nir = torch.abs(nir_t2 - nir_t1)
-
-        edge_t1 = self._gradient_magnitude_2d(rgb_t1.mean(dim=1, keepdim=True))
-        edge_t2 = self._gradient_magnitude_2d(rgb_t2.mean(dim=1, keepdim=True))
-        diff_edge = torch.abs(edge_t2 - edge_t1)
-
-        hp_all = torch.abs(diff_all - F.avg_pool2d(diff_all, kernel_size=3, stride=1, padding=1))
-
-        diff_all = self._robust_norm_map(diff_all)
-        diff_rgb = self._robust_norm_map(diff_rgb)
-        diff_ndvi = self._robust_norm_map(diff_ndvi)
-        diff_nir = self._robust_norm_map(diff_nir)
-        diff_edge = self._robust_norm_map(diff_edge)
-        hp_all = self._robust_norm_map(hp_all)
-
-        coarse_logits_up = F.interpolate(
-            coarse_logits_2d.unsqueeze(1),
-            size=diff_all.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        refine_input = torch.cat(
-            [coarse_logits_up, diff_all, diff_rgb, diff_ndvi, diff_nir, diff_edge, hp_all],
-            dim=1,
-        )
-        return refine_input
-
-    def _refine_change_map(self, batch, coarse_logits: torch.Tensor):
-        if not self.use_refine_change_head:
-            return None, None, None, None
-        b, n = coarse_logits.shape
-        g = int(n ** 0.5)
-        if g * g != n:
-            return None, None, None, None
-        coarse_logits_2d = coarse_logits.view(b, 1, g, g)
-        refine_input = self._build_refine_inputs(batch, coarse_logits_2d.squeeze(1))
-        if refine_input is None:
-            return None, None, None, None
-
-        feat = self.change_refine_net(refine_input)
-        residual_logits = self.change_refine_head(feat)
-        boundary_logits = self.change_boundary_head(feat)
-        coarse_logits_up = F.interpolate(
-            coarse_logits_2d,
-            size=residual_logits.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        refined_logits = residual_logits + self.change_refine_coarse_weight * coarse_logits_up + self.change_boundary_weight * boundary_logits
-        refined_probs = torch.sigmoid(refined_logits)
-        return refined_logits, refined_probs, boundary_logits, coarse_logits_up
 
     def _build_bitemporal_from_two_streams(
         self,
@@ -555,12 +336,12 @@ class ViLTransformerSS(pl.LightningModule):
             dim=-1,
         )  # [B, N, 4*hs]
 
-        change_logits = self.change_head(change_input).squeeze(-1)
-        change_global_logits = self.change_global_head(temp_feats.squeeze(1)).squeeze(-1)
+        change_logits = self.change_head(change_input).squeeze(-1)  # [B, N]
+        change_global_logits = self.change_global_head(temp_feats.squeeze(1)).squeeze(-1)  # [B]
 
-        change_probs_local = torch.sigmoid(change_logits)
-        change_probs_global = torch.sigmoid(change_global_logits).unsqueeze(1)
-        change_probs_fused = change_probs_local * change_probs_global
+        change_probs_local = torch.sigmoid(change_logits)  # [B, N]
+        change_probs_global = torch.sigmoid(change_global_logits).unsqueeze(1)  # [B, 1]
+        change_probs_fused = change_probs_local * change_probs_global  # [B, N]
 
         g = int(N ** 0.5)
         change_map = None
@@ -578,8 +359,8 @@ class ViLTransformerSS(pl.LightningModule):
 
     def _predict_change_with_multiscale_decoder(self, image_t1_feats, temp_feats, image_t2_feats):
         """
-        Multi-scale decoder head.
-        Returns the same API as legacy head.
+        New multi-scale decoder head.
+        Returns exactly the same API as legacy head.
         """
         B = image_t1_feats.size(0)
         N = image_t1_feats.size(1)
@@ -598,12 +379,12 @@ class ViLTransformerSS(pl.LightningModule):
         local_logits_2d = self.change_decoder(change_input)  # [B, G, G]
         g = local_logits_2d.shape[-1]
 
-        change_logits = local_logits_2d.view(B, -1)
-        change_global_logits = self.change_global_head(temp_feats.squeeze(1)).squeeze(-1)
+        change_logits = local_logits_2d.view(B, -1)  # [B, N]
+        change_global_logits = self.change_global_head(temp_feats.squeeze(1)).squeeze(-1)  # [B]
 
-        change_probs_local = torch.sigmoid(change_logits)
-        change_probs_global = torch.sigmoid(change_global_logits).unsqueeze(1)
-        change_probs_fused = change_probs_local * change_probs_global
+        change_probs_local = torch.sigmoid(change_logits)  # [B, N]
+        change_probs_global = torch.sigmoid(change_global_logits).unsqueeze(1)  # [B, 1]
+        change_probs_fused = change_probs_local * change_probs_global  # [B, N]
 
         change_map = change_probs_fused.view(B, g, g)
 
@@ -614,151 +395,6 @@ class ViLTransformerSS(pl.LightningModule):
             change_probs_global,
             change_probs_fused,
             change_map,
-        )
-
-    def _predict_change_with_detail_head(self, image_t1_feats, image_t2_feats):
-        """
-        Local detail branch:
-        uses only T1, T2 and |T2-T1| to preserve finer local variation.
-        """
-        detail_input = torch.cat(
-            [
-                image_t1_feats,
-                image_t2_feats,
-                torch.abs(image_t2_feats - image_t1_feats),
-            ],
-            dim=-1,
-        )  # [B, N, 3*hs]
-
-        detail_logits = self.change_detail_head(detail_input).squeeze(-1)  # [B, N]
-        return detail_logits
-
-    def _predict_change_with_hybrid_decoder(
-        self,
-        image_t1_feats,
-        temp_feats,
-        image_t2_feats,
-        text_summary_feats=None,
-        osm_struct=None,
-        has_osm=None,
-        batch=None,
-    ):
-        """
-        Hybrid fusion:
-        - legacy head: local baseline
-        - multiscale decoder: spatial coherence
-        - detail head: local correction
-        - structured OSM prior: semantic modulation patch/global
-        """
-        (
-            legacy_change_logits,
-            legacy_change_global_logits,
-            _legacy_probs_local,
-            _legacy_probs_global,
-            _legacy_probs_fused,
-            _legacy_change_map,
-        ) = self._predict_change_with_legacy_head(
-            image_t1_feats=image_t1_feats,
-            temp_feats=temp_feats,
-            image_t2_feats=image_t2_feats,
-        )
-
-        (
-            ms_change_logits,
-            _ms_change_global_logits,
-            _ms_probs_local,
-            _ms_probs_global,
-            _ms_probs_fused,
-            _ms_change_map,
-        ) = self._predict_change_with_multiscale_decoder(
-            image_t1_feats=image_t1_feats,
-            temp_feats=temp_feats,
-            image_t2_feats=image_t2_feats,
-        )
-
-        detail_change_logits = self._predict_change_with_detail_head(
-            image_t1_feats=image_t1_feats,
-            image_t2_feats=image_t2_feats,
-        )
-
-        alpha = self.change_fusion_alpha
-        beta = self.change_fusion_beta
-        gamma = self.change_fusion_gamma
-
-        change_logits = (
-            alpha * legacy_change_logits
-            + beta * ms_change_logits
-            + gamma * detail_change_logits
-        )
-
-        change_global_logits = legacy_change_global_logits
-
-        change_struct_patch_logits = None
-        change_struct_global_logits = None
-
-        if self.use_structured_osm and osm_struct is not None:
-            B, N, hs = image_t1_feats.shape
-            struct_proj = self.osm_struct_proj(osm_struct)
-            struct_expand = struct_proj.unsqueeze(1).expand(B, N, -1)
-
-            if text_summary_feats is None:
-                text_summary_feats = torch.zeros_like(struct_proj)
-            text_expand = text_summary_feats.unsqueeze(1).expand(B, N, -1)
-
-            diff_feats = torch.abs(image_t2_feats - image_t1_feats)
-            patch_sem_in = torch.cat([diff_feats, text_expand, struct_expand], dim=-1)
-            change_struct_patch_logits = self.osm_struct_patch_head(patch_sem_in).squeeze(-1)
-
-            global_sem_in = torch.cat([temp_feats.squeeze(1), text_summary_feats, struct_proj], dim=-1)
-            change_struct_global_logits = self.osm_struct_global_head(global_sem_in).squeeze(-1)
-
-            if has_osm is None:
-                has_osm = torch.ones(B, 1, device=image_t1_feats.device)
-
-            change_logits = change_logits + self.osm_struct_patch_weight * change_struct_patch_logits * has_osm
-            change_global_logits = change_global_logits + self.osm_struct_global_weight * change_struct_global_logits * has_osm.squeeze(1)
-
-        change_probs_local = torch.sigmoid(change_logits)
-        change_probs_global = torch.sigmoid(change_global_logits).unsqueeze(1)
-        change_probs_fused = change_probs_local * change_probs_global
-
-        B, N = change_probs_fused.shape
-        g = int(N ** 0.5)
-        change_map = None
-        if g * g == N:
-            change_map = change_probs_fused.view(B, g, g)
-
-        change_refined_logits_up = None
-        change_refined_probs_up = None
-        change_refined_map_up = None
-        change_boundary_logits_up = None
-        change_boundary_probs_up = None
-        if batch is not None:
-            refined_logits_up, refined_probs_up, boundary_logits_up, _coarse_logits_up = self._refine_change_map(
-                batch=batch,
-                coarse_logits=change_logits,
-            )
-            if refined_logits_up is not None:
-                change_refined_logits_up = refined_logits_up.squeeze(1)
-                change_refined_probs_up = refined_probs_up.squeeze(1)
-                change_refined_map_up = change_refined_probs_up
-                change_boundary_logits_up = boundary_logits_up.squeeze(1)
-                change_boundary_probs_up = torch.sigmoid(change_boundary_logits_up)
-
-        return (
-            change_logits,
-            change_global_logits,
-            change_probs_local,
-            change_probs_global,
-            change_probs_fused,
-            change_map,
-            change_struct_patch_logits,
-            change_struct_global_logits,
-            change_refined_logits_up,
-            change_refined_probs_up,
-            change_refined_map_up,
-            change_boundary_logits_up,
-            change_boundary_probs_up,
         )
 
     def infer(
@@ -919,9 +555,6 @@ class ViLTransformerSS(pl.LightningModule):
             temp_feats = None
             image_t2_feats = None
 
-        text_summary_feats = self._masked_mean_pool(text_feats, text_masks)
-        osm_struct, has_osm = self._get_osm_struct(batch, text_feats.device, text_feats.size(0))
-
         # ===================== Change head outputs ===================== #
         change_logits = None
         change_global_logits = None
@@ -929,13 +562,6 @@ class ViLTransformerSS(pl.LightningModule):
         change_probs_global = None
         change_probs_fused = None
         change_map = None
-        change_struct_patch_logits = None
-        change_struct_global_logits = None
-        change_refined_logits_up = None
-        change_refined_probs_up = None
-        change_refined_map_up = None
-        change_boundary_logits_up = None
-        change_boundary_probs_up = None
 
         if image_t1_feats is not None and temp_feats is not None and image_t2_feats is not None:
             if self.use_multiscale_change_decoder:
@@ -946,21 +572,10 @@ class ViLTransformerSS(pl.LightningModule):
                     change_probs_global,
                     change_probs_fused,
                     change_map,
-                    change_struct_patch_logits,
-                    change_struct_global_logits,
-                    change_refined_logits_up,
-                    change_refined_probs_up,
-                    change_refined_map_up,
-                    change_boundary_logits_up,
-                    change_boundary_probs_up,
-                ) = self._predict_change_with_hybrid_decoder(
+                ) = self._predict_change_with_multiscale_decoder(
                     image_t1_feats=image_t1_feats,
                     temp_feats=temp_feats,
                     image_t2_feats=image_t2_feats,
-                    text_summary_feats=text_summary_feats,
-                    osm_struct=osm_struct,
-                    has_osm=has_osm,
-                    batch=batch,
                 )
             else:
                 (
@@ -978,7 +593,6 @@ class ViLTransformerSS(pl.LightningModule):
 
         ret = {
             "text_feats": text_feats,
-            "text_summary_feats": text_summary_feats,
             "image_feats": image_feats,
             "image_cls": image_cls,
             "image_t1_feats": image_t1_feats,
@@ -986,13 +600,6 @@ class ViLTransformerSS(pl.LightningModule):
             "image_t2_feats": image_t2_feats,
             "change_logits": change_logits,
             "change_global_logits": change_global_logits,
-            "change_struct_patch_logits": change_struct_patch_logits,
-            "change_struct_global_logits": change_struct_global_logits,
-            "change_refined_logits_up": change_refined_logits_up,
-            "change_refined_probs_up": change_refined_probs_up,
-            "change_refined_map_up": change_refined_map_up,
-            "change_boundary_logits_up": change_boundary_logits_up,
-            "change_boundary_probs_up": change_boundary_probs_up,
             "change_probs_local": change_probs_local,
             "change_probs_global": change_probs_global,
             "change_probs_fused": change_probs_fused,
@@ -1005,8 +612,6 @@ class ViLTransformerSS(pl.LightningModule):
             "text_ids": text_ids,
             "text_masks": text_masks,
             "patch_index": patch_index,
-            "osm_struct": osm_struct,
-            "has_osm": has_osm,
             "out_feats": out_feats,
         }
         return ret
