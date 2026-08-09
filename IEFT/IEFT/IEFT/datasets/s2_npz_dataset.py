@@ -15,6 +15,25 @@ class S2NPZDataset(Dataset):
         "T2_B2", "T2_B3", "T2_B4", "T2_B8",
     ]
 
+    STRUCT_NAMES = [
+        "has_any",
+        "has_main",
+        "has_summary",
+        "has_source",
+        "tag_count_norm",
+        "phrase_count_norm",
+        "has_building",
+        "has_road",
+        "has_residential",
+        "has_industrial",
+        "has_commercial",
+        "has_green",
+        "has_water",
+        "has_railway",
+        "has_barrier",
+        "has_construction",
+    ]
+
     def __init__(
         self,
         npz_paths: List[str],
@@ -30,6 +49,10 @@ class S2NPZDataset(Dataset):
         osm_max_phrases: int = 3,
         osm_text_key: str = "text_v12",
         osm_fallback_text: str = "no_osm_context",
+        osm_compose_mode: str = "signature_compact",
+        osm_word_budget: int = 32,
+        osm_joiner: str = " ; ",
+        osm_include_source_text: bool = False,
     ):
         super().__init__()
         if not npz_paths:
@@ -53,12 +76,18 @@ class S2NPZDataset(Dataset):
         self.osm_text_key = str(osm_text_key).strip() or "text_v12"
         self.osm_fallback_text = str(osm_fallback_text).strip() or "no_osm_context"
 
+        self.osm_compose_mode = str(osm_compose_mode).strip().lower() or "signature_compact"
+        self.osm_word_budget = max(4, int(osm_word_budget))
+        self.osm_joiner = str(osm_joiner)
+        self.osm_include_source_text = bool(osm_include_source_text)
+
         self._lengths = []
         self._cum = []
         self.bands = self.DEFAULT_BANDS
 
         self.osm_texts_by_patch: Dict[str, List[str]] = {}
         self.osm_main_text_by_patch: Dict[str, str] = {}
+        self.osm_struct_by_patch: Dict[str, torch.Tensor] = {}
         self.osm_negative_text_pool: List[str] = []
 
         total = 0
@@ -107,6 +136,23 @@ class S2NPZDataset(Dataset):
                 out.append(x)
         return out
 
+    def _truncate_words(self, text: str, max_words: int = None) -> str:
+        text = self._clean_text(text)
+        if not text:
+            return ""
+        max_words = self.osm_word_budget if max_words is None else int(max_words)
+        words = text.split()
+        if len(words) <= max_words:
+            return text
+        return " ".join(words[:max_words])
+
+    def _join_parts(self, parts: List[str], max_words: int = None) -> str:
+        parts = [self._clean_text(p) for p in parts if self._clean_text(p)]
+        if len(parts) == 0:
+            return ""
+        text = self.osm_joiner.join(parts)
+        return self._truncate_words(text, max_words=max_words)
+
     def _build_text_from_phrases(self, phrases: List[str]) -> str:
         phrases = [self._clean_text(p) for p in phrases if self._clean_text(p)]
         if len(phrases) == 0:
@@ -115,17 +161,125 @@ class S2NPZDataset(Dataset):
         phrases = phrases[:self.osm_max_phrases]
 
         if self.osm_text_mode == "first":
-            return phrases[0]
+            return self._truncate_words(phrases[0])
 
         if self.osm_text_mode == "random":
-            return random.choice(phrases)
+            return self._truncate_words(random.choice(phrases))
 
-        return " ".join(phrases)
+        return self._join_parts(phrases)
+
+    def _compose_record_text(self, raw_main: str, raw_summary: str, tags: List[str], phrases: List[str], raw_source: str) -> str:
+        mode = self.osm_compose_mode
+
+        if mode == "main_only":
+            return self._truncate_words(raw_main or raw_summary or raw_source)
+
+        if mode == "summary_plus_tags":
+            if raw_summary:
+                return self._join_parts([raw_summary, " ".join(tags[:6])])
+            if raw_main:
+                return self._join_parts([raw_main, " ".join(tags[:6])])
+            if len(tags) > 0:
+                return self._truncate_words(" ".join(tags[:8]))
+            if len(phrases) > 0:
+                return self._build_text_from_phrases(phrases)
+            return self._truncate_words(raw_source)
+
+        if mode == "phrases_compact":
+            if len(phrases) > 0:
+                return self._build_text_from_phrases(phrases)
+            if raw_summary:
+                return self._truncate_words(raw_summary)
+            if raw_main:
+                return self._truncate_words(raw_main)
+            if len(tags) > 0:
+                return self._truncate_words(" ".join(tags[:8]))
+            return self._truncate_words(raw_source)
+
+        if mode == "signature_compact":
+            parts = []
+            if raw_main:
+                parts.append(raw_main)
+            elif raw_summary:
+                parts.append(raw_summary)
+            if len(tags) > 0:
+                parts.append("tags " + " ".join(tags[:6]))
+            if len(phrases) > 0:
+                phrase_text = self._build_text_from_phrases(phrases)
+                if phrase_text:
+                    parts.append(phrase_text)
+            if self.osm_include_source_text and raw_source:
+                parts.append(raw_source)
+            text = self._join_parts(parts)
+            if text:
+                return text
+            if raw_source:
+                return self._truncate_words(raw_source)
+            return ""
+
+        if mode == "auto":
+            parts = []
+            if raw_summary:
+                parts.append(raw_summary)
+            elif raw_main:
+                parts.append(raw_main)
+            if len(tags) > 0:
+                parts.append(" ".join(tags[:5]))
+            if len(phrases) > 0:
+                parts.append(self._build_text_from_phrases(phrases))
+            if self.osm_include_source_text and raw_source:
+                parts.append(raw_source)
+            text = self._join_parts(parts)
+            if text:
+                return text
+            return self._truncate_words(raw_main or raw_summary or raw_source)
+
+        if raw_main:
+            return self._truncate_words(raw_main)
+        if raw_summary:
+            return self._truncate_words(raw_summary)
+        if len(tags) > 0:
+            return self._truncate_words(" | ".join(tags[:8]))
+        if len(phrases) > 0:
+            return self._build_text_from_phrases(phrases)
+        if raw_source:
+            return self._truncate_words(raw_source)
+        return ""
+
+    def _contains_any(self, texts: List[str], keywords: List[str]) -> float:
+        joint = " ".join([t for t in texts if t]).lower()
+        return 1.0 if any(k in joint for k in keywords) else 0.0
+
+    def _build_struct_vector(self, raw_main: str, raw_summary: str, tags: List[str], phrases: List[str], raw_source: str) -> torch.Tensor:
+        texts = [raw_main, raw_summary, raw_source] + list(tags) + list(phrases)
+        tag_count_norm = min(len(tags) / 8.0, 1.0)
+        phrase_count_norm = min(len(phrases) / 4.0, 1.0)
+
+        feats = [
+            1.0 if any(self._clean_text(t) for t in texts) else 0.0,
+            1.0 if raw_main else 0.0,
+            1.0 if raw_summary else 0.0,
+            1.0 if raw_source else 0.0,
+            tag_count_norm,
+            phrase_count_norm,
+            self._contains_any(texts, ["building", "house", "roof", "residential_building"]),
+            self._contains_any(texts, ["road", "highway", "street", "path", "track"]),
+            self._contains_any(texts, ["residential", "neighbourhood", "apartments"]),
+            self._contains_any(texts, ["industrial", "factory", "warehouse"]),
+            self._contains_any(texts, ["commercial", "retail", "shop", "market"]),
+            self._contains_any(texts, ["tree", "forest", "grass", "park", "green", "vegetation"]),
+            self._contains_any(texts, ["water", "river", "lake", "basin", "stream"]),
+            self._contains_any(texts, ["railway", "rail", "station"]),
+            self._contains_any(texts, ["barrier", "wall", "fence"]),
+            self._contains_any(texts, ["construction", "construction_site", "works", "building_site"]),
+        ]
+        return torch.tensor(feats, dtype=torch.float32)
 
     def _load_osm_texts(self):
         if not self.osm_texts_json:
             self.osm_texts_by_patch = {}
             self.osm_main_text_by_patch = {}
+            self.osm_struct_by_patch = {}
             self.osm_negative_text_pool = []
             print("[S2NPZDataset] INFO: No OSM JSON provided. Using fallback text.")
             return
@@ -134,6 +288,7 @@ class S2NPZDataset(Dataset):
             print(f"[S2NPZDataset] WARN: osm_texts_json not found: {self.osm_texts_json}")
             self.osm_texts_by_patch = {}
             self.osm_main_text_by_patch = {}
+            self.osm_struct_by_patch = {}
             self.osm_negative_text_pool = []
             return
 
@@ -141,26 +296,31 @@ class S2NPZDataset(Dataset):
             data = json.load(f)
 
         if not isinstance(data, dict):
-            raise ValueError(
-                f"osm_texts_json must contain a dict patch_id -> list[str] or dict, got {type(data)}"
-            )
+            raise ValueError(f"osm_texts_json must contain a dict patch_id -> list[str] or dict, got {type(data)}")
 
         texts_by_patch: Dict[str, List[str]] = {}
         main_text_by_patch: Dict[str, str] = {}
+        struct_by_patch: Dict[str, torch.Tensor] = {}
         negative_pool: List[str] = []
 
         for k, v in data.items():
             patch_id = str(k)
             phrases: List[str] = []
             main_text = ""
+            raw_main = ""
+            raw_summary = ""
+            raw_source = ""
+            tags: List[str] = []
 
             if isinstance(v, str):
                 phrases = [self._clean_text(v)]
                 main_text = self._build_text_from_phrases(phrases)
+                raw_main = main_text
 
             elif isinstance(v, list):
                 phrases = [self._clean_text(x) for x in v if self._clean_text(x)]
                 main_text = self._build_text_from_phrases(phrases)
+                raw_main = main_text
 
             elif isinstance(v, dict):
                 raw_main = self._clean_text(v.get(self.osm_text_key, ""))
@@ -182,21 +342,17 @@ class S2NPZDataset(Dataset):
                 else:
                     phrases = []
 
-                if raw_main:
-                    main_text = raw_main
-                elif raw_summary:
-                    main_text = raw_summary
-                elif len(tags) > 0:
-                    main_text = " | ".join(tags)
-                elif len(phrases) > 0:
-                    main_text = self._build_text_from_phrases(phrases)
-                elif raw_source:
-                    main_text = raw_source
-                else:
-                    main_text = ""
+                phrases = self._dedup_keep_order(phrases)
+                main_text = self._compose_record_text(
+                    raw_main=raw_main,
+                    raw_summary=raw_summary,
+                    tags=tags,
+                    phrases=phrases,
+                    raw_source=raw_source,
+                )
 
                 if len(phrases) == 0 and raw_source:
-                    phrases = [raw_source]
+                    phrases = [self._truncate_words(raw_source)]
                 if len(phrases) == 0 and main_text:
                     phrases = [main_text]
 
@@ -204,8 +360,12 @@ class S2NPZDataset(Dataset):
                 phrases = []
                 main_text = ""
 
-            phrases = [p for p in phrases if p]
+            phrases = [self._clean_text(p) for p in phrases if self._clean_text(p)]
+            phrases = self._dedup_keep_order(phrases)
+            phrases = [self._truncate_words(p) for p in phrases if self._truncate_words(p)]
+
             main_text = self._clean_text(main_text)
+            main_text = self._truncate_words(main_text)
 
             if not main_text and len(phrases) > 0:
                 main_text = self._build_text_from_phrases(phrases)
@@ -215,16 +375,20 @@ class S2NPZDataset(Dataset):
 
             texts_by_patch[patch_id] = phrases
             main_text_by_patch[patch_id] = main_text
+            struct_by_patch[patch_id] = self._build_struct_vector(raw_main, raw_summary, tags, phrases, raw_source)
             negative_pool.append(main_text)
 
         self.osm_texts_by_patch = texts_by_patch
         self.osm_main_text_by_patch = main_text_by_patch
+        self.osm_struct_by_patch = struct_by_patch
         self.osm_negative_text_pool = self._dedup_keep_order(negative_pool)
 
         print(
             f"[S2NPZDataset] Loaded OSM texts: "
             f"{len(self.osm_main_text_by_patch)} patch entries, "
-            f"{len(self.osm_negative_text_pool)} unique main texts."
+            f"{len(self.osm_negative_text_pool)} unique main texts. "
+            f"compose_mode={self.osm_compose_mode}, text_mode={self.osm_text_mode}, "
+            f"word_budget={self.osm_word_budget}, struct_dim={len(self.STRUCT_NAMES)}"
         )
 
     def __len__(self) -> int:
@@ -248,7 +412,6 @@ class S2NPZDataset(Dataset):
 
     def _make_rgb(self, x8: torch.Tensor, which: str) -> torch.Tensor:
         which = which.upper()
-
         if which == "T1":
             b2, b3, b4 = x8[0], x8[1], x8[2]
         else:
@@ -259,22 +422,14 @@ class S2NPZDataset(Dataset):
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
         rgb = rgb.unsqueeze(0)
-        rgb = F.interpolate(
-            rgb,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
+        rgb = F.interpolate(rgb, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         return rgb.squeeze(0)
 
     def _tokenize(self, texts: List[str]):
         if self.tokenizer is None:
             B = len(texts)
             L = self.max_text_len
-            return (
-                torch.zeros((B, L), dtype=torch.long),
-                torch.ones((B, L), dtype=torch.long),
-            )
+            return (torch.zeros((B, L), dtype=torch.long), torch.ones((B, L), dtype=torch.long))
 
         enc = self.tokenizer(
             texts,
@@ -290,31 +445,24 @@ class S2NPZDataset(Dataset):
 
     def _build_main_text(self, patch_id: str) -> str:
         patch_id = str(patch_id)
-
         if patch_id in self.osm_main_text_by_patch:
             return self.osm_main_text_by_patch[patch_id]
-
         phrases = self._get_osm_phrases_for_patch(patch_id)
         if len(phrases) > 0:
             built = self._build_text_from_phrases(phrases)
             if built:
                 return built
-
         return self.osm_fallback_text
 
     def _build_negative_text(self, current_main_text: str, neg_idx: int) -> str:
         pool = self.osm_negative_text_pool
-
         if len(pool) == 0:
             return self.osm_fallback_text
-
         if len(pool) == 1:
             return pool[0]
-
         candidates = [t for t in pool if t != current_main_text]
         if len(candidates) == 0:
             return random.choice(pool)
-
         return random.choice(candidates)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -336,6 +484,7 @@ class S2NPZDataset(Dataset):
         osm_phrases = self._get_osm_phrases_for_patch(patch_id)
         main_text = self._build_main_text(patch_id)
         has_osm_text = int(str(patch_id) in self.osm_main_text_by_patch)
+        osm_struct = self.osm_struct_by_patch.get(str(patch_id), torch.zeros(len(self.STRUCT_NAMES), dtype=torch.float32))
 
         sample = {
             "idx": int(idx),
@@ -347,6 +496,7 @@ class S2NPZDataset(Dataset):
             "osm_texts": osm_phrases,
             "main_text": main_text,
             "has_osm_text": has_osm_text,
+            "osm_struct": osm_struct.clone().float(),
         }
 
         d.close()
@@ -372,6 +522,7 @@ class S2NPZDataset(Dataset):
         out["osm_texts"] = [b["osm_texts"] for b in batch]
         out["main_text"] = [b["main_text"] for b in batch]
         out["has_osm_text"] = torch.tensor([b["has_osm_text"] for b in batch], dtype=torch.long)
+        out["osm_struct"] = torch.stack([b["osm_struct"] for b in batch], dim=0)
 
         texts = out["main_text"]
         text_ids, text_masks = self._tokenize(texts)

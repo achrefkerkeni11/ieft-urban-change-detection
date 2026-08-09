@@ -1,12 +1,11 @@
 # IEFT/datasets/__init__.py
-# Certains datasets peuvent ne pas être disponibles / importables selon l'OS,
-# les dépendances, ou des différences de noms de classes.
-# On rend les imports optionnels pour ne pas bloquer l'exécution (ex: s2_npz).
-
-# --- Always available (our custom dataset) ---
 from .s2_npz_dataset import S2NPZDataset
 
-# --- Optional datasets (do not break import if missing) ---
+try:
+    from .levir_cd_dataset import LevirCDDataset
+except Exception:
+    LevirCDDataset = None
+
 try:
     from .vg_caption_dataset import VisualGenomeCaptionDataset
 except Exception:
@@ -47,18 +46,9 @@ try:
 except Exception:
     RSICDCaptionKarpathyDataset = None
 
-
-# -------------------- SYDNEY (robust) --------------------
-# IMPORTANT:
-# Le nom de la classe Sydney peut différer selon le repo.
-# On tente plusieurs noms possibles sans casser l'import global.
-
 SydneyCaptionKarpathyDataset = None
 try:
-    # On importe le module une seule fois, puis on cherche plusieurs noms possibles dedans.
     import IEFT.datasets.sydney_caption_karpathy_dataset as _syd_mod
-
-    # Essais de noms possibles (ordre du plus probable au moins probable)
     for _name in ["SydneyCaptionKarpathyDataset", "SYDNEYCaptionKarpathyDataset", "SydneyCaptionDataset"]:
         if hasattr(_syd_mod, _name):
             SydneyCaptionKarpathyDataset = getattr(_syd_mod, _name)
@@ -66,9 +56,7 @@ try:
 except Exception:
     SydneyCaptionKarpathyDataset = None
 
-# Alias de compatibilité: certains datamodules utilisent ce nom en MAJUSCULES
 SYDNEYCaptionKarpathyDataset = SydneyCaptionKarpathyDataset
-
 
 try:
     from .ucm_caption_karpathy_dataset import UCMCaptionKarpathyDataset

@@ -1,3 +1,8 @@
+# -*- coding: utf-8 -*-
+# Rollback stable v20d-compatible config generated from the user's provided config.
+# Main change: task_levir_cd_v20_cliprank_vitb16_levir_dense_completion keeps CLIP runtime disabled
+# because the stable v20d-compatible vilt_module.py does not inject CLIP into logits.
+
 from sacred import Experiment
 
 ex = Experiment("ViLT", save_git_info=False)
@@ -20,420 +25,432 @@ def _loss_names(d):
 def config():
     exp_name = "vilt"
     seed = 0
-    datasets = ["coco", "vg", "sbu", "gcc"]
-    loss_names = _loss_names({"itm": 1, "mlm": 1})
-    batch_size = 4096  # desired effective batch size
+    datasets = ["levir_cd"]
+    loss_names = _loss_names({"irtr": 0})
 
-    # Image setting
-    train_transform_keys = ["pixelbert"]
+    batch_size = 8
+    per_gpu_batchsize = 8
+    num_workers = 4
+    num_gpus = 1
+    num_nodes = 1
+    precision = 16
+
+    train_transform_keys = ["pixelbert_randaug"]
     val_transform_keys = ["pixelbert"]
-    image_size = 384
+    image_size = 256
+    model_input_size = 256
+    patch_size = 16
     max_image_len = -1
-    patch_size = 32
-    draw_false_image = 1
+    draw_false_image = 0
     image_only = False
 
-    # Text setting
-    vqav2_label_size = 3129
     max_text_len = 40
     tokenizer = "bert-base-uncased"
     vocab_size = 30522
+    draw_false_text = 0
     whole_word_masking = False
     mlm_prob = 0.15
-    draw_false_text = 0
+    levir_fixed_text = "building change detection"
 
-    # OSM / external text setting
-    osm_texts_json = ""
-    osm_text_mode = "concat"   # first | random | concat
-    osm_max_phrases = 3
+    vit = "vit_small_patch16_224"
+    vit_pretrained = True
+    vit_encoder_ckpt_path = ""
+    vit_encoder_partial_load = True
+    vit_encoder_freeze_steps = 0
 
-    # Transformer setting
-    vit = "vit_base_patch32_384"
-    hidden_size = 768
-    num_heads = 12
-    num_layers = 12
+    hidden_size = 384
+    num_heads = 6
+    num_layers = 4
     mlp_ratio = 4
-    drop_rate = 0.1
+    drop_rate = 0.10
 
-    # Optimizer setting
     optim_type = "adamw"
-    learning_rate = 1e-4
-    weight_decay = 0.01
-    decay_power = 1
-    max_epoch = 100
-    max_steps = 25000
-    warmup_steps = 2500
-    end_lr = 0
-    lr_mult = 1
+    learning_rate = 3e-4
+    encoder_learning_rate = 2e-5
+    weight_decay = 0.05
+    max_epoch = 40
+    max_steps = 6000
+    warmup_steps = 200
+    end_lr = 0.0
+    lr_mult = 1.0
 
-    # Change detection setting
-    s2_scale_div = 10000.0
-    change_loss_weight = 1.0
-    change_global_loss_weight = 0.20
-    change_smoothness_loss_weight = 0.05
-    change_pos_quantile = 0.90
-    change_neg_quantile = 0.35
-
-    # Downstream setting
     get_recall_metric = False
-
-    # PL trainer setting
     resume_from = None
     fast_dev_run = False
     val_check_interval = 1.0
     test_only = False
 
-    # Environment-dependent params
     data_root = ""
     log_dir = "result"
-    per_gpu_batchsize = 0
-    num_gpus = 1
-    num_nodes = 1
     load_path = ""
-    num_workers = 8
-    precision = 16
+    json = ""
 
-    json = "/home/amax/wyj/dataset/RSITMD/dataset_RSITMD.json"
+    levir_label_dirname = "label"
+    levir_image_a_dirname = "A"
+    levir_image_b_dirname = "B"
+    levir_mask_threshold = 127
 
+    levir_train_crop_size = 256
+    levir_val_crop_size = 256
+    levir_tile_size = 256
+    levir_tile_stride = 256
+    levir_train_repeat = 8
+    levir_train_focus_positive = True
+    levir_train_positive_focus_prob = 0.62
+    levir_train_hard_negative_prob = 0.20
+    levir_train_random_aug = True
+    levir_label_smoothing = 0.0
+    levir_train_positive_thr = 0.003
+    levir_train_negative_mining_mode = "rural_structural"
+    levir_train_hard_negative_gamma = 2.2
+    levir_train_hard_negative_min_weight = 0.02
+    levir_train_extreme_negative_prob = 0.10
+    levir_train_extreme_negative_quantile = 0.88
+    levir_train_positive_thr = 0.003
+    levir_train_negative_mining_mode = "rural_structural"
+    levir_train_hard_negative_gamma = 2.0
+    levir_train_hard_negative_min_weight = 0.02
+    levir_train_extreme_negative_prob = 0.10
+    levir_train_extreme_negative_quantile = 0.88
 
-@ex.named_config
-def env_dandelin():
-    data_root = "/data2/dsets/dataset"
-    log_dir = "/data2/vilt/result"
-    num_gpus = 1
-    num_nodes = 1
+    use_semantic_multiscale = True
+    ms_change_num_levels = 4
+    ms_change_level_indices = [2, 5, 8, 11]
+    ms_change_decoder_dim = 160
+    ms_change_dropout = 0.08
 
+    change_global_gate_floor = 0.80
+    change_apply_global_gate_to_dense = False
+    change_apply_global_gate_to_coarse = False
+    change_global_aux_scale = 0.05
+    change_dense_coarse_fuse_weight = 0.08
+    change_dense_global_bias_scale = 0.08
 
-@ex.named_config
-def task_mlm_itm():
-    exp_name = "mlm_itm"
-    datasets = ["coco", "vg", "sbu", "gcc"]
-    loss_names = _loss_names({"itm": 1, "mlm": 1})
-    batch_size = 4096
-    max_epoch = 10
-    max_image_len = 200
+    change_dense_pos_weight = 5.0
+    change_local_pos_weight = 5.0
+    change_boundary_pos_weight = 3.0
 
+    change_dense_bce_weight = 0.52
+    change_dense_dice_weight = 0.48
+    change_local_loss_weight = 0.10
+    change_global_loss_weight = 0.12
+    change_boundary_loss_weight = 0.10
+    change_boundary_dice_weight = 0.06
+    change_color_only_penalty_weight = 0.02
+    change_deep_sup_loss_weight = 0.05
+    change_no_change_penalty_weight = 0.14
+    change_no_change_max_penalty_weight = 0.18
+    change_no_change_topk_penalty_weight = 0.14
+    change_no_change_topk = 64
+    change_force_binary_gt_for_losses = True
+    change_force_binary_gt_threshold = 0.5
+    change_dense_completion_weight = 0.08
+    change_dense_completion_kernel = 5
 
-@ex.named_config
-def task_mlm_itm_randaug():
-    exp_name = "mlm_itm_randaug"
-    datasets = ["coco", "vg", "sbu", "gcc"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 1, "mlm": 1})
-    batch_size = 4096
-    max_epoch = 10
-    max_image_len = 200
+    dense_export_no_change_global_thr = 0.16
+    dense_export_no_change_mean_thr = 0.030
 
+    levir_use_osm = False
+    levir_osm_texts_json = ""
+    levir_osm_text_mode = "concat"
+    levir_osm_max_phrases = 3
+    levir_osm_text_key = "text_v21"
+    levir_osm_fallback_text = "no_osm_context"
+    levir_osm_compose_mode = "signature_compact"
+    levir_osm_word_budget = 32
+    levir_osm_joiner = " ; "
+    levir_osm_include_source_text = False
 
-@ex.named_config
-def task_mlm_itm_mpp():
-    exp_name = "mlm_itm_mpp"
-    datasets = ["coco", "vg", "sbu", "gcc"]
-    loss_names = _loss_names({"itm": 1, "mlm": 1, "mpp": 1})
-    batch_size = 4096
-    max_epoch = 10
-    max_image_len = 200
+    change_use_osm_struct = False
+    change_osm_struct_dim = 16
+    change_osm_struct_hidden = 128
+    change_osm_global_weight = 0.10
+    change_osm_coarse_weight = 0.08
+    change_osm_dense_weight = 0.05
+    change_osm_patch_weight = 0.10
+    change_osm_gate_floor = 0.10
+    change_osm_reliability_bias = 0.0
+    change_osm_use_text = False
 
+    change_clip_filter_runtime = False
+    clip_topk = 2
+    clip_min_keep = 1
+    clip_use_summary = True
+    clip_use_main_text = True
 
-@ex.named_config
-def task_finetune_nlvr2():
-    exp_name = "finetune_nlvr2"
-    datasets = ["nlvr2"]
-    loss_names = _loss_names({"nlvr2": 1})
-    batch_size = 128
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    draw_false_image = 0
-    learning_rate = 1e-4
-
-
-@ex.named_config
-def task_finetune_nlvr2_randaug():
-    exp_name = "finetune_nlvr2_randaug"
-    datasets = ["nlvr2"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"nlvr2": 1})
-    batch_size = 128
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    draw_false_image = 0
-    learning_rate = 1e-4
-
-
-@ex.named_config
-def task_finetune_vqa():
-    exp_name = "finetune_vqa"
-    datasets = ["vqa"]
-    loss_names = _loss_names({"vqa": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    draw_false_image = 0
-    learning_rate = 1e-4
-    val_check_interval = 0.1
-    lr_mult = 10
-
-
-@ex.named_config
-def task_finetune_vqa_randaug():
-    exp_name = "finetune_vqa_randaug"
-    datasets = ["vqa"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"vqa": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    draw_false_image = 0
-    learning_rate = 1e-4
-    val_check_interval = 0.1
-    lr_mult = 10
+    export_panel_title_bar_h = 40
+    export_panel_font_size = 18
 
 
 @ex.named_config
-def task_finetune_irtr_coco():
-    exp_name = "finetune_irtr_coco"
-    datasets = ["coco"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
+def task_levir_cd_v15_pixel_object_dense256():
+    exp_name = "levir_cd_v15_pixel_object_dense256"
+    datasets = ["levir_cd"]
+    loss_names = _loss_names({"irtr": 0})
+
+    image_size = 256
+    model_input_size = 256
+    patch_size = 16
+    hidden_size = 384
+    num_heads = 6
+    num_layers = 4
+    vit = "vit_small_patch16_224"
+
+    batch_size = 8
+    per_gpu_batchsize = 8
+    num_workers = 0
+    max_epoch = 40
+    max_steps = 6000
+    warmup_steps = 200
+
+    encoder_learning_rate = 2e-5
+    learning_rate = 3e-4
+    weight_decay = 0.05
+
+    levir_train_crop_size = 256
+    levir_val_crop_size = 256
+    levir_tile_size = 256
+    levir_tile_stride = 256
+    levir_train_repeat = 8
+    levir_train_focus_positive = True
+    levir_train_positive_focus_prob = 0.62
+    levir_train_hard_negative_prob = 0.20
+    levir_train_random_aug = True
+    levir_label_smoothing = 0.01
+
+    use_semantic_multiscale = True
+    ms_change_num_levels = 4
+    ms_change_level_indices = [2, 5, 8, 11]
+    ms_change_decoder_dim = 160
+    ms_change_dropout = 0.08
+
+    change_global_gate_floor = 0.80
+    change_apply_global_gate_to_dense = False
+    change_apply_global_gate_to_coarse = False
+    change_global_aux_scale = 0.05
+    change_dense_coarse_fuse_weight = 0.08
+    change_dense_global_bias_scale = 0.08
+
+    change_dense_pos_weight = 5.0
+    change_local_pos_weight = 5.0
+    change_boundary_pos_weight = 3.0
+
+    change_dense_bce_weight = 0.52
+    change_dense_dice_weight = 0.48
+    change_local_loss_weight = 0.10
+    change_global_loss_weight = 0.12
+    change_boundary_loss_weight = 0.10
+    change_boundary_dice_weight = 0.06
+    change_color_only_penalty_weight = 0.02
+    change_deep_sup_loss_weight = 0.05
+    change_no_change_penalty_weight = 0.14
+    change_no_change_max_penalty_weight = 0.18
+    change_no_change_topk_penalty_weight = 0.14
+    change_no_change_topk = 64
 
 
 @ex.named_config
-def task_finetune_irtr_coco_randaug():
-    exp_name = "finetune_irtr_coco_randaug"
-    datasets = ["coco"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
+def task_levir_cd_v18_multimodal_clip_dense256_safe():
+    exp_name = "levir_cd_v18_multimodal_clip_dense256_safe"
+    datasets = ["levir_cd"]
+    loss_names = _loss_names({"irtr": 0})
+
+    image_size = 256
+    model_input_size = 256
+    patch_size = 16
+    hidden_size = 384
+    num_heads = 6
+    num_layers = 4
+    vit = "vit_small_patch16_224"
+    vit_pretrained = True
+
+    batch_size = 8
+    per_gpu_batchsize = 8
+    num_workers = 0
+    max_epoch = 40
+    max_steps = 6000
+    warmup_steps = 200
+
+    encoder_learning_rate = 2e-5
+    learning_rate = 3e-4
+    weight_decay = 0.05
+
+    levir_train_crop_size = 256
+    levir_val_crop_size = 256
+    levir_tile_size = 256
+    levir_tile_stride = 256
+    levir_train_repeat = 8
+    levir_train_focus_positive = True
+    levir_train_positive_focus_prob = 0.62
+    levir_train_hard_negative_prob = 0.20
+    levir_train_random_aug = True
+    levir_label_smoothing = 0.01
+
+    use_semantic_multiscale = True
+    ms_change_num_levels = 4
+    ms_change_level_indices = [2, 5, 8, 11]
+    ms_change_decoder_dim = 160
+    ms_change_dropout = 0.08
+
+    change_global_gate_floor = 0.80
+    change_apply_global_gate_to_dense = False
+    change_apply_global_gate_to_coarse = False
+    change_global_aux_scale = 0.05
+    change_dense_coarse_fuse_weight = 0.08
+    change_dense_global_bias_scale = 0.08
+
+    change_dense_pos_weight = 5.0
+    change_local_pos_weight = 5.0
+    change_boundary_pos_weight = 3.0
+
+    change_dense_bce_weight = 0.52
+    change_dense_dice_weight = 0.48
+    change_local_loss_weight = 0.10
+    change_global_loss_weight = 0.12
+    change_boundary_loss_weight = 0.10
+    change_boundary_dice_weight = 0.06
+    change_color_only_penalty_weight = 0.02
+    change_deep_sup_loss_weight = 0.05
+    change_no_change_penalty_weight = 0.14
+    change_no_change_max_penalty_weight = 0.18
+    change_no_change_topk_penalty_weight = 0.14
+    change_no_change_topk = 64
+
+    levir_use_osm = True
+    levir_osm_texts_json = "data_osm\\osm_texts_by_patch_levir_v21.json"
+    levir_osm_text_mode = "concat"
+    levir_osm_max_phrases = 3
+    levir_osm_text_key = "text_v21"
+    levir_osm_fallback_text = "no_osm_context"
+    levir_osm_compose_mode = "signature_compact"
+    levir_osm_word_budget = 32
+    levir_osm_joiner = " ; "
+    levir_osm_include_source_text = False
+
+    change_use_osm_struct = True
+    change_osm_struct_dim = 16
+    change_osm_struct_hidden = 128
+    change_osm_global_weight = 0.18
+    change_osm_coarse_weight = 0.14
+    change_osm_dense_weight = 0.10
+    change_osm_patch_weight = 0.18
+    change_osm_gate_floor = 0.18
+    change_osm_reliability_bias = 0.05
+    change_osm_use_text = False
+
+    change_clip_filter_runtime = False
+    clip_topk = 2
+    clip_min_keep = 1
+    clip_use_summary = True
+    clip_use_main_text = True
 
 
 @ex.named_config
-def task_finetune_irtr_f30k():
-    exp_name = "finetune_irtr_f30k"
-    datasets = ["f30k"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
+def task_levir_cd_v20_cliprank_vitb16_levir_dense_completion():
+    exp_name = "levir_cd_v20_cliprank_vitb16_levir_dense_completion"
+    datasets = ["levir_cd"]
+    loss_names = _loss_names({"irtr": 0})
 
-
-@ex.named_config
-def task_finetune_irtr_f30k_randaug():
-    exp_name = "finetune_irtr_f30k_randaug"
-    datasets = ["f30k"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 10
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-
-
-@ex.named_config
-def task_finetune_irtr_sydney_randaug():
-    exp_name = "finetune_irtr_sydney_randaug"
-    datasets = ["sydney"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 512
-    max_epoch = 100
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-    json = "/home/amax/wyj/dataset/Sydney_captions/karpathy/dataset.json"
-
-
-@ex.named_config
-def task_finetune_irtr_ucm_randaug():
-    exp_name = "finetune_irtr_ucm_randaug"
-    datasets = ["ucm"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 100
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-    json = "/home/amax/wyj/dataset/UCM_captions/karpathy/dataset.json"
-
-
-@ex.named_config
-def task_finetune_irtr_rsicd_randaug():
-    exp_name = "finetune_irtr_rsicd_randaug"
-    datasets = ["rsicd"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 50
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-    json = "/home/amax/wyj/dataset/RSICD_captions/karpathy/dataset_rsicd.json"
-
-
-@ex.named_config
-def task_finetune_irtr_rsitmd_randaug():
-    exp_name = "finetune_irtr_rsicd_randaug"
-    datasets = ["rsitmd"]
-    train_transform_keys = ["pixelbert_randaug"]
-    loss_names = _loss_names({"itm": 0.5, "irtr": 1})
-    batch_size = 256
-    max_epoch = 50
-    max_steps = None
-    warmup_steps = 0.1
-    get_recall_metric = True
-    draw_false_text = 15
-    learning_rate = 1e-4
-    json = "/home/amax/wyj/dataset/RSITMD/dataset_RSITMD.json"
-
-
-@ex.named_config
-def step25k():
-    max_epoch = 100
-    max_steps = 25000
-
-
-@ex.named_config
-def step50k():
-    max_epoch = 100
-    max_steps = 50000
-
-
-@ex.named_config
-def step100k():
-    max_epoch = 100
-    max_steps = 100000
-
-
-@ex.named_config
-def step200k():
-    max_epoch = 200
-    max_steps = 200000
-
-
-@ex.named_config
-def vit32_base():
-    vit = "vit_base_patch32_384"
-    patch_size = 32
+    image_size = 256
+    model_input_size = 256
+    patch_size = 16
+    vit = "vit_base_patch16_224"
+    vit_pretrained = False
+    vit_encoder_ckpt_path = ""
+    vit_encoder_partial_load = True
+    vit_encoder_freeze_steps = 300
     hidden_size = 768
     num_heads = 12
-    num_layers = 12
+    num_layers = 4
 
-
-@ex.named_config
-def task_smoke_s2_npz():
-    exp_name = "smoke_s2_npz"
-    datasets = ["s2_npz"]
-    data_root = "data_npz"
-
-    per_gpu_batchsize = 1
-    batch_size = 1
+    batch_size = 8
+    per_gpu_batchsize = 8
     num_workers = 0
-    num_gpus = 1
-    num_nodes = 1
+    max_epoch = 40
+    max_steps = 8000
+    warmup_steps = 300
 
-    max_epoch = 1
-    max_steps = 5
-    warmup_steps = 0
-    get_recall_metric = False
+    encoder_learning_rate = 1e-5
+    learning_rate = 2e-4
+    weight_decay = 0.05
 
-    load_path = "weights/vilt_200k_mlm_itm.ckpt"
+    levir_train_crop_size = 256
+    levir_val_crop_size = 256
+    levir_tile_size = 256
+    levir_tile_stride = 256
+    levir_train_repeat = 8
+    levir_train_focus_positive = True
+    levir_train_positive_focus_prob = 0.66
+    levir_train_hard_negative_prob = 0.28
+    levir_train_random_aug = True
+    levir_label_smoothing = 0.0
+    levir_train_positive_thr = 0.003
+    levir_train_negative_mining_mode = "rural_structural"
+    levir_train_hard_negative_gamma = 2.2
+    levir_train_hard_negative_min_weight = 0.02
+    levir_train_extreme_negative_prob = 0.10
+    levir_train_extreme_negative_quantile = 0.88
 
-    image_size = 384
-    vit = "vit_base_patch32_384"
-    patch_size = 32
+    use_semantic_multiscale = True
+    ms_change_num_levels = 4
+    ms_change_level_indices = [2, 5, 8, 11]
+    ms_change_decoder_dim = 128
+    ms_change_dropout = 0.08
 
-    train_transform_keys = ["pixelbert_randaug"]
-    val_transform_keys = ["pixelbert"]
-@ex.named_config
-def task_finetune_s2_npz_irtr_osm():
-    exp_name = "finetune_irtr_rsicd_randaug"
-    datasets = ["s2_npz"]
-    data_root = "data_npz"
+    change_global_gate_floor = 0.82
+    change_apply_global_gate_to_dense = False
+    change_apply_global_gate_to_coarse = False
+    change_global_aux_scale = 0.05
+    change_dense_coarse_fuse_weight = 0.10
+    change_dense_global_bias_scale = 0.08
 
-    loss_names = _loss_names({"irtr": 1})
-    get_recall_metric = False
+    change_dense_pos_weight = 5.0
+    change_local_pos_weight = 5.0
+    change_boundary_pos_weight = 3.0
 
-    per_gpu_batchsize = 1
-    batch_size = 1
-    num_workers = 0
-    num_gpus = 1
-    num_nodes = 1
+    change_dense_bce_weight = 0.50
+    change_dense_dice_weight = 0.50
+    change_local_loss_weight = 0.10
+    change_global_loss_weight = 0.12
+    change_boundary_loss_weight = 0.10
+    change_boundary_dice_weight = 0.06
+    change_color_only_penalty_weight = 0.03
+    change_deep_sup_loss_weight = 0.05
+    change_no_change_penalty_weight = 0.18
+    change_no_change_max_penalty_weight = 0.20
+    change_no_change_topk_penalty_weight = 0.16
+    change_no_change_topk = 64
+    change_force_binary_gt_for_losses = True
+    change_force_binary_gt_threshold = 0.5
+    change_dense_completion_weight = 0.10
+    change_dense_completion_kernel = 5
 
-    max_epoch = 20
-    max_steps = 5000
-    warmup_steps = 0
+    levir_use_osm = True
+    levir_osm_texts_json = "data_osm\\osm_texts_by_patch_levir_v21.json"
+    levir_osm_text_mode = "concat"
+    levir_osm_max_phrases = 4
+    levir_osm_text_key = "text_v21"
+    levir_osm_fallback_text = "no_osm_context"
+    levir_osm_compose_mode = "signature_compact"
+    levir_osm_word_budget = 40
+    levir_osm_joiner = " ; "
+    levir_osm_include_source_text = False
 
-    draw_false_image = 1
-    draw_false_text = 2
+    change_use_osm_struct = True
+    change_osm_struct_dim = 16
+    change_osm_struct_hidden = 128
+    change_osm_global_weight = 0.14
+    change_osm_coarse_weight = 0.10
+    change_osm_dense_weight = 0.08
+    change_osm_patch_weight = 0.14
+    change_osm_gate_floor = 0.16
+    change_osm_reliability_bias = 0.05
+    change_osm_use_text = False
 
-    image_size = 384
-    vit = "vit_base_patch32_384"
-    patch_size = 32
-    train_transform_keys = ["pixelbert_randaug"]
-    val_transform_keys = ["pixelbert"]
-
-    max_text_len = 40
-@ex.named_config
-def task_s2_npz_irtr_v14():
-    exp_name = "finetune_irtr_rsicd_randaug"
-    datasets = ["s2_npz"]
-
-    train_transform_keys = ["pixelbert_randaug"]
-    val_transform_keys = ["pixelbert"]
-
-    loss_names = _loss_names({"irtr": 1})
-
-    data_root = "data_npz"
-
-    per_gpu_batchsize = 1
-    batch_size = 1
-    num_workers = 0
-    num_gpus = 1
-    num_nodes = 1
-
-    max_epoch = 1
-    max_steps = 100
-    warmup_steps = 0
-
-    get_recall_metric = False
-    draw_false_text = 2
-
-    image_size = 384
-    vit = "vit_base_patch32_384"
-    patch_size = 32
-
-    max_text_len = 40
-    osm_text_mode = "first"
-    osm_max_phrases = 1
-
-    change_loss_weight = 1.0
-    
+    # Rollback stable v20d: CLIP is not injected inside vilt_module.py.
+    # Keep OSM structured guidance; CLIP can be used offline later to build a better OSM JSON.
+    change_clip_filter_runtime = False
+    clip_topk = 2
+    clip_min_keep = 1
+    clip_use_summary = True
+    clip_use_main_text = True

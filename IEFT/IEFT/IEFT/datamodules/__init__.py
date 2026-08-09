@@ -1,4 +1,3 @@
-# IEFT/datamodules/__init__.py
 import warnings
 
 _datamodules = {}
@@ -32,5 +31,8 @@ _safe_import("IEFT.datamodules.rsitmd_caption_karpathy_datamodule", "RSITMDCapti
 # --- sydney (optional) ---
 _safe_import("IEFT.datamodules.sydney_caption_karpathy_datamodule", "SydneyCaptionKarpathyDataModule", "sydney")
 
-# --- your new datamodule ---
+# --- current Sentinel-2 datamodule ---
 _safe_import("IEFT.datamodules.s2_npz_datamodule", "S2NPZDataModule", "s2_npz")
+
+# --- new LEVIR-CD datamodule ---
+_safe_import("IEFT.datamodules.levir_cd_datamodule", "LEVIRCDDataModule", "levir_cd")

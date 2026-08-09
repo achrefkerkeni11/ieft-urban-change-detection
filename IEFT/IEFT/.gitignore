@@ -1,22 +1,24 @@
-# Data and outputs
-data_raw/
-data_osm/
-data_npz/
-features/
-outputs/
-result/
-weights/
-dummy_data/
-
-# Python caches
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.ipynb
 
-# HuggingFace cache
+outputs/
+result/
+api_runs/
+data_*/
+dummy_data/
 .hf_home/
+.venv/
+env/
 
-# OS generated files
-.DS_Store
-Thumbs.db
+model/
+!model/.gitkeep
+
+*.ckpt
+*.pth
+*.pt
+
+.vscode/
+.idea/
