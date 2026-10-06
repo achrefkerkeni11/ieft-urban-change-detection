@@ -360,11 +360,22 @@ class EmbeddingEMA(nn.Module):
 
 
 class EMAVectorQuantizer(nn.Module):
-    def __init__(self, n_embed, embedding_dim, beta, decay=0.99, eps=1e-5,codebook_dim, num_tokens,
-                remap=None, unknown_index="random"):
+    def __init__(
+        self,
+        n_embed,
+        embedding_dim,
+        beta,
+        decay=0.99,
+        eps=1e-5,
+        codebook_dim=None,
+        num_tokens=None,
+        remap=None,
+        unknown_index="random",
+    ):
         super().__init__()
-        self.codebook_dim = codebook_dim
-        self.num_tokens = num_tokens
+        self.codebook_dim = embedding_dim if codebook_dim is None else codebook_dim
+        self.num_tokens = n_embed if num_tokens is None else num_tokens
+        self.n_embed = self.num_tokens
         self.beta = beta
         self.embedding = EmbeddingEMA(self.num_tokens, self.codebook_dim, decay, eps)
 
@@ -379,7 +390,7 @@ class EMAVectorQuantizer(nn.Module):
             print(f"Remapping {self.n_embed} indices to {self.re_embed} indices. "
                   f"Using {self.unknown_index} for unknown indices.")
         else:
-            self.re_embed = n_embed
+            self.re_embed = self.num_tokens
 
     def remap_to_used(self, inds):
         ishape = inds.shape
@@ -444,8 +455,3 @@ class EMAVectorQuantizer(nn.Module):
         #z_q, 'b h w c -> b c h w'
         z_q = rearrange(z_q, 'b h w c -> b c h w')
         return z_q, loss, (perplexity, encodings, encoding_indices)
-
-
-if __name__ == '__main__':
-    mdoel = VectorQuantizer(n_e=, embed_dim, beta=0.25,
-                                        remap=remap, sane_index_shape=sane_index_shape)

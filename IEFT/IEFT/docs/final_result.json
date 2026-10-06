@@ -1,0 +1,78 @@
+{
+  "schema": "ieft.final_result.v1",
+  "created_at_utc": "2026-08-26T13:44:16.197545+00:00",
+  "dataset": {
+    "id": "LEVIR-CD-official-637",
+    "train_scenes": 445,
+    "validation_scenes": 64,
+    "test_scenes": 128
+  },
+  "training": {
+    "initialization": "random",
+    "optimizer_steps": 118000,
+    "batch_size": 1,
+    "precision": 16,
+    "recovery_checkpoints": [40000, 80000],
+    "completed_without_resume": true,
+    "configuration": [
+      "task_levir_cd_v20_cliprank_vitb16_levir_dense_completion",
+      "levir_scratch_full_base",
+      "levir_scratch_rgb",
+      "levir_final_rgb_osm_instance_safe_spectral"
+    ]
+  },
+  "artifacts": {
+    "checkpoint": {
+      "size_bytes": 1564322778,
+      "sha256": "00836fe490c1e9e291bc477414d4d3e8314281186c438cb8c086302371c2e11d"
+    },
+    "osm_manifest_sha256": "7a2345439a64e438efc50e178e156142702b57b298b63a37594536c23911616b",
+    "spectral_manifest_sha256": "2311e86a36f09c80348d632af09fd64b28314996edee612a784824e09b4b3841",
+    "validation_threshold_artifact_sha256": "a30fa81570616ed5dca8a8d85ac433bf3f3857c312958640c7c5375c0cabf261"
+  },
+  "protocol": {
+    "name": "ieft-levir-full-scene-hann-v1",
+    "tile_size": 256,
+    "tile_stride": 128,
+    "blend": "modified_hann",
+    "hann_floor": 0.2,
+    "threshold_stage": "after_full_scene_reconstruction",
+    "semantic_postprocessing": "none"
+  },
+  "validation": {
+    "threshold": 0.747,
+    "source_pixels": 67108864,
+    "confusion": {
+      "tp": 2427956,
+      "fp": 482274,
+      "fn": 388312,
+      "tn": 63810322
+    },
+    "metrics": {
+      "iou": 0.7360694512909037,
+      "f1": 0.8479723558796318,
+      "precision": 0.8342832009841147,
+      "recall": 0.8621182359065259,
+      "oa": 0.9870272576808929
+    }
+  },
+  "test": {
+    "threshold": 0.747,
+    "source_pixels": 134217728,
+    "confusion": {
+      "tp": 5865362,
+      "fp": 1100057,
+      "fn": 972042,
+      "tn": 126280267
+    },
+    "metrics": {
+      "iou": 0.7389468748255897,
+      "f1": 0.8498786081658802,
+      "precision": 0.842068797297047,
+      "recall": 0.8578346401646005,
+      "oa": 0.9845616593956947
+    },
+    "optional_instance_count": 16215,
+    "instance_semantic_support_preserved": true
+  }
+}

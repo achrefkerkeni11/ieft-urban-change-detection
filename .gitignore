@@ -1,0 +1,15 @@
+# Generated Python/editor files shared by all model directories.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp*/
+.test_tmp/
+*.egg-info/
+.venv/
+.vscode/
+.idea/
+~$*
+*.log
+*.tmp
+.coverage
+htmlcov/

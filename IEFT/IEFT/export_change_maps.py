@@ -1,21 +1,85 @@
+"""Canonical full-scene visual exporter with the historical horizontal panel style.
+
+This exporter is intentionally VISUALIZATION-ONLY.
+
+It does NOT:
+- reload the model,
+- rerun GPU inference,
+- tune a threshold,
+- apply the historical component-completion / precision / no-change post-processing.
+
+Instead it consumes the already-generated canonical full-scene NPZ archives
+from ``predict_full_scenes.py`` and the frozen official TEST report from
+``evaluate_full_scenes.py``.
+
+The probability array is auto-discovered and accepted only if thresholding it
+with the frozen TEST threshold reproduces the official TEST confusion matrix
+exactly.  This keeps the visual output scientifically aligned with the reported
+IoU/F1/Precision/Recall/OA.
+
+The panel layout intentionally follows the old exporter style: one long
+horizontal row with white title bars.
+"""
+
+from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
+import shutil
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import torch
-import yaml
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage as ndi
 from tqdm import tqdm
 
-from IEFT.modules.vilt_module import ViLTransformerSS
-from IEFT.datasets.levir_cd_dataset import LEVIROSMHelper
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+# Preference only. A key is NEVER accepted just because of its name: it must
+# reproduce the official confusion matrix exactly at the frozen threshold.
+PREFERRED_PROBABILITY_NAMES = (
+    "probability",
+    "probabilities",
+    "prob",
+    "prob_map",
+    "full_scene_prob",
+    "full_scene_probability",
+    "scene_prob",
+    "scene_probability",
+    "semantic_prob",
+    "semantic_probability",
+    "stitched_prob",
+    "stitched_probability",
+    "change_prob",
+    "change_probability",
+    "pred_prob",
+    "pred_prob_raw",
+    "change_refined_map_up",
+)
+
+LOW_PRIORITY_TERMS = (
+    "center",
+    "offset",
+    "instance",
+    "coverage",
+    "weight",
+    "valid",
+    "mask",
+    "label",
+    "ground",
+    "gt",
+)
 
 
-def ensure_dir(path: str):
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def ensure_dir(path: str | Path) -> None:
     os.makedirs(path, exist_ok=True)
 
 
@@ -30,24 +94,31 @@ def binary_mask_to_uint8(mask: np.ndarray) -> np.ndarray:
     return ((np.asarray(mask) > 0).astype(np.uint8) * 255)
 
 
-def save_png_gray(arr01: np.ndarray, out_path: str):
+def save_png_gray(arr01: np.ndarray, out_path: str | Path) -> None:
     Image.fromarray(float01_to_uint8_gray(arr01), mode="L").save(out_path)
 
 
-def save_png_binary(mask: np.ndarray, out_path: str):
+def save_png_binary(mask: np.ndarray, out_path: str | Path) -> None:
     Image.fromarray(binary_mask_to_uint8(mask), mode="L").save(out_path)
 
 
-def save_png_rgb(arr_uint8: np.ndarray, out_path: str):
-    Image.fromarray(arr_uint8, mode="RGB").save(out_path)
+def save_png_rgb(arr_uint8: np.ndarray, out_path: str | Path) -> None:
+    Image.fromarray(np.asarray(arr_uint8, dtype=np.uint8), mode="RGB").save(out_path)
 
 
-def make_binary_overlay(base_rgb: np.ndarray, binary_mask: np.ndarray, alpha: float = 0.55) -> np.ndarray:
+def make_binary_overlay(
+    base_rgb: np.ndarray,
+    binary_mask: np.ndarray,
+    alpha: float = 0.55,
+    color: Tuple[int, int, int] = (255, 0, 0),
+) -> np.ndarray:
     base = np.asarray(base_rgb, dtype=np.float32)
     mask = (np.asarray(binary_mask) > 0).astype(np.float32)[..., None]
-    red = np.zeros_like(base, dtype=np.float32)
-    red[..., 0] = 255.0
-    overlay = base * (1.0 - mask * alpha) + red * (mask * alpha)
+    paint = np.zeros_like(base, dtype=np.float32)
+    paint[..., 0] = float(color[0])
+    paint[..., 1] = float(color[1])
+    paint[..., 2] = float(color[2])
+    overlay = base * (1.0 - mask * alpha) + paint * (mask * alpha)
     return np.clip(overlay, 0.0, 255.0).astype(np.uint8)
 
 
@@ -56,7 +127,7 @@ def _load_font(font_size: int):
         "arial.ttf",
         "Arial.ttf",
         "DejaVuSans.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
     ]
     for fp in font_candidates:
         try:
@@ -66,7 +137,14 @@ def _load_font(font_size: int):
     return ImageFont.load_default()
 
 
-def add_title_bar(img: np.ndarray, title: str, bar_h: int = 40, font_size: int = 18) -> np.ndarray:
+def add_title_bar(
+    img: np.ndarray,
+    title: str,
+    bar_h: int = 40,
+    font_size: int = 18,
+) -> np.ndarray:
+    """Same white title-bar visual style used by the historical exporter."""
+    img = np.asarray(img, dtype=np.uint8)
     if img.ndim == 2:
         img = np.stack([img, img, img], axis=-1)
     h, w, c = img.shape
@@ -75,1044 +153,1384 @@ def add_title_bar(img: np.ndarray, title: str, bar_h: int = 40, font_size: int =
     pil = Image.fromarray(canvas, mode="RGB")
     draw = ImageDraw.Draw(pil)
     font = _load_font(font_size)
-    draw.text((8, max(4, (bar_h - font_size) // 2)), title, fill=(0, 0, 0), font=font)
+    draw.text(
+        (8, max(4, (bar_h - font_size) // 2)),
+        title,
+        fill=(0, 0, 0),
+        font=font,
+    )
     return np.asarray(pil)
 
 
-def make_panel(images_with_titles, pad: int = 8, title_bar_h: int = 40, font_size: int = 18):
-    prepared = [add_title_bar(img, title, bar_h=title_bar_h, font_size=font_size) for title, img in images_with_titles]
+def make_panel(
+    images_with_titles: Sequence[Tuple[str, np.ndarray]],
+    pad: int = 8,
+    title_bar_h: int = 40,
+    font_size: int = 18,
+) -> np.ndarray:
+    """Historical one-row horizontal panel layout."""
+    prepared = [
+        add_title_bar(
+            img,
+            title,
+            bar_h=title_bar_h,
+            font_size=font_size,
+        )
+        for title, img in images_with_titles
+    ]
+
     max_h = max(p.shape[0] for p in prepared)
     total_w = sum(p.shape[1] for p in prepared) + pad * (len(prepared) + 1)
-    panel = np.full((max_h + 2 * pad, total_w, 3), 255, dtype=np.uint8)
+
+    panel = np.full(
+        (max_h + 2 * pad, total_w, 3),
+        255,
+        dtype=np.uint8,
+    )
+
     x = pad
     for img in prepared:
         h, w, _ = img.shape
         y = pad + (max_h - h) // 2
-        panel[y:y + h, x:x + w] = img
+        panel[y : y + h, x : x + w] = img
         x += w + pad
+
     return panel
 
 
+def natural_scene_key(scene_id: str) -> Tuple[str, int]:
+    head, sep, tail = scene_id.rpartition("_")
+    if sep and tail.isdigit():
+        return head, int(tail)
+    return scene_id, -1
+
+
 def _is_image_file(name: str) -> bool:
-    return name.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"))
+    return name.lower().endswith(IMAGE_EXTS)
 
 
-def list_split_triplets(data_root: str, split: str, a_dir="A", b_dir="B", l_dir="label"):
-    root = Path(data_root) / split
-    dir_a = root / a_dir
-    dir_b = root / b_dir
-    dir_l = root / l_dir
-    if not dir_a.is_dir() or not dir_b.is_dir() or not dir_l.is_dir():
-        raise FileNotFoundError(f"Missing split folders under {root}")
-    a_files = {Path(n).stem: dir_a / n for n in os.listdir(dir_a) if _is_image_file(n)}
-    b_files = {Path(n).stem: dir_b / n for n in os.listdir(dir_b) if _is_image_file(n)}
-    l_files = {Path(n).stem: dir_l / n for n in os.listdir(dir_l) if _is_image_file(n)}
-    common = sorted(set(a_files) & set(b_files) & set(l_files))
-    return [(stem, str(a_files[stem]), str(b_files[stem]), str(l_files[stem])) for stem in common]
+# ---------------------------------------------------------------------------
+# LEVIR source files
+# ---------------------------------------------------------------------------
+
+def find_split_root(data_root: Path, split: str) -> Path:
+    for candidate in (split, split.lower(), split.upper(), split.capitalize()):
+        path = data_root / candidate
+        if path.is_dir():
+            return path
+    raise FileNotFoundError(
+        f"Could not find split '{split}' under {data_root}"
+    )
 
 
-def build_hann_window(size: int) -> np.ndarray:
-    w = np.hanning(size).astype(np.float32)
-    w = np.outer(w, w).astype(np.float32)
-    w = w / max(w.max(), 1e-6)
-    return (0.20 + 0.80 * w).astype(np.float32)
+def find_subdir(split_root: Path, names: Sequence[str]) -> Path:
+    for name in names:
+        path = split_root / name
+        if path.is_dir():
+            return path
+    raise FileNotFoundError(
+        f"Could not find any of {list(names)} under {split_root}"
+    )
 
 
-def tile_positions(length: int, tile: int, stride: int):
-    if length <= tile:
-        return [0]
-    xs = list(range(0, length - tile + 1, stride))
-    if xs[-1] != length - tile:
-        xs.append(length - tile)
-    return xs
+def find_scene_file(directory: Path, scene_id: str) -> Path:
+    for ext in IMAGE_EXTS:
+        path = directory / f"{scene_id}{ext}"
+        if path.is_file():
+            return path
+
+    matches = [
+        path
+        for path in directory.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTS
+        and path.stem == scene_id
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    raise FileNotFoundError(
+        f"Could not find image for scene '{scene_id}' in {directory}"
+    )
 
 
-def _find_hparams_path_from_ckpt(ckpt_path: str) -> str:
-    ckpt_path = os.path.abspath(ckpt_path)
-    version_dir = os.path.dirname(os.path.dirname(ckpt_path))
-    return os.path.join(version_dir, "hparams.yaml")
+def load_rgb(path: Path) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
 
-def _load_hparams_config(ckpt_path: str) -> dict:
-    hparams_path = _find_hparams_path_from_ckpt(ckpt_path)
-    if not os.path.isfile(hparams_path):
-        return {}
-    with open(hparams_path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        return {}
-    if "config" in data and isinstance(data["config"], dict):
-        return dict(data["config"])
-    if "hyper_parameters" in data and isinstance(data["hyper_parameters"], dict):
-        return dict(data["hyper_parameters"])
-    return dict(data)
+def load_binary(path: Path) -> np.ndarray:
+    return (
+        np.asarray(Image.open(path).convert("L"), dtype=np.uint8) > 127
+    ).astype(np.uint8)
 
 
-def build_cfg(args):
-    defaults = {
-        "exp_name": "export_change_maps_safe_rural_v3",
-        "datasets": ["levir_cd"],
-        "loss_names": {"itm": 0, "mlm": 0, "mpp": 0, "vqa": 0, "nlvr2": 0, "irtr": 0},
-        "batch_size": 1,
-        "per_gpu_batchsize": 1,
-        "num_workers": 0,
-        "num_gpus": 0,
-        "num_nodes": 1,
-        "precision": 16,
-        "image_size": args.model_input_size,
-        "model_input_size": args.model_input_size,
-        "patch_size": 16,
-        "hidden_size": 768,
-        "num_heads": 12,
-        "num_layers": 4,
-        "drop_rate": 0.10,
-        "vit": "vit_base_patch16_224",
-        "vit_pretrained": False,
-        "tokenizer": "bert-base-uncased",
-        "vocab_size": 30522,
-        "max_text_len": 40,
-        "data_root": args.data_root,
-        "load_path": args.ckpt_path,
-        "levir_label_dirname": "label",
-        "levir_image_a_dirname": "A",
-        "levir_image_b_dirname": "B",
-        "levir_fixed_text": "building change detection",
-        "change_global_gate_floor": 0.95,
-        "dense_export_no_change_global_thr": 0.20,
-        "dense_export_no_change_mean_thr": 0.030,
-        "levir_use_osm": False,
-        "levir_osm_texts_json": "",
-        "levir_osm_text_mode": "concat",
-        "levir_osm_max_phrases": 3,
-        "levir_osm_text_key": "text_v21",
-        "levir_osm_fallback_text": "no_osm_context",
-        "levir_osm_compose_mode": "signature_compact",
-        "levir_osm_word_budget": 32,
-        "levir_osm_joiner": " ; ",
-        "levir_osm_include_source_text": False,
-        "export_panel_title_bar_h": 40,
-        "export_panel_font_size": 18,
-        "use_semantic_multiscale": True,
-        "ms_change_num_levels": 4,
-        "ms_change_level_indices": [2, 5, 8, 11],
-        "ms_change_decoder_dim": 128,
-        "ms_change_dropout": 0.08,
-    }
-    cfg = defaults.copy()
-    cfg.update(_load_hparams_config(args.ckpt_path))
-    cfg["data_root"] = args.data_root
-    cfg["load_path"] = args.ckpt_path
-    cfg["image_size"] = args.model_input_size
-    cfg["model_input_size"] = args.model_input_size
-    if str(args.levir_osm_texts_json).strip():
-        cfg["levir_osm_texts_json"] = str(args.levir_osm_texts_json).strip()
-        cfg["levir_use_osm"] = True
-    if bool(args.disable_osm):
-        cfg["levir_use_osm"] = False
-    return cfg
-
-
-def resize_rgb(img: np.ndarray, size: int) -> np.ndarray:
-    return np.asarray(Image.fromarray(img, mode="RGB").resize((size, size), resample=Image.BILINEAR), dtype=np.uint8)
-
-
-def resize_prob(prob: np.ndarray, size_hw) -> np.ndarray:
-    h, w = size_hw
-    prob = np.asarray(prob, dtype=np.float32)
-    prob = np.squeeze(prob)
-    if prob.ndim != 2:
-        raise ValueError(f"resize_prob expected 2D array after squeeze, got shape={prob.shape}")
-    prob_u8 = float01_to_uint8_gray(prob)
-    return np.asarray(
-        Image.fromarray(prob_u8, mode="L").resize((w, h), resample=Image.BILINEAR),
-        dtype=np.float32,
-    ) / 255.0
-
-
-def _resolve_osm(osm_helper: LEVIROSMHelper, patch_id: str, fallback_text: str):
-    if osm_helper is None:
-        return None
-    return osm_helper.resolve([patch_id], fallback_text=fallback_text)
-
-
-def make_batch_from_tiles(
-    t1_tile_u8: np.ndarray,
-    t2_tile_u8: np.ndarray,
-    device,
-    patch_id: str = "tile",
-    osm_helper: LEVIROSMHelper = None,
-    osm_resolved=None,
-    fallback_text: str = "building change detection",
-):
-    t1 = torch.from_numpy(t1_tile_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
-    t2 = torch.from_numpy(t2_tile_u8.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).contiguous()
-
-    if osm_resolved is None and osm_helper is not None:
-        osm_resolved = _resolve_osm(osm_helper, patch_id, fallback_text)
-
-    if osm_resolved is not None:
-        main_text = str(osm_resolved["main_text"])
-        has_osm_text = int(osm_resolved["has_osm_text"])
-        osm_struct = osm_resolved["osm_struct"].clone().float()
-        osm_texts = list(osm_resolved["osm_texts"])
-    else:
-        main_text = fallback_text
-        has_osm_text = 0
-        osm_struct = torch.zeros(16, dtype=torch.float32)
-        osm_texts = []
-
-    return {
-        "image": [t2.to(device)],
-        "image_t1": [t1.to(device)],
-        "image_t2": [t2.to(device)],
-        "text_ids": torch.zeros(1, 40, dtype=torch.long, device=device),
-        "text_masks": torch.zeros(1, 40, dtype=torch.long, device=device),
-        "text_labels": torch.full((1, 40), -100, dtype=torch.long, device=device),
-        "text": [main_text],
-        "main_text": [main_text],
-        "file": [patch_id],
-        "img_index": torch.tensor([0], dtype=torch.long, device=device),
-        "image_index": torch.tensor([0], dtype=torch.long, device=device),
-        "has_osm_text": torch.tensor([has_osm_text], dtype=torch.long, device=device),
-        "osm_struct": osm_struct.unsqueeze(0).to(device),
-        "osm_texts": [osm_texts],
-    }
-
+# ---------------------------------------------------------------------------
+# Temporal-delta visualization from the historical exporter
+# ---------------------------------------------------------------------------
 
 def _gradient_magnitude(gray01: np.ndarray) -> np.ndarray:
-    sx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
-    sy = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
-    gx = ndi.convolve(gray01.astype(np.float32), sx, mode="reflect")
-    gy = ndi.convolve(gray01.astype(np.float32), sy, mode="reflect")
+    sx = np.array(
+        [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+        dtype=np.float32,
+    )
+    sy = np.array(
+        [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+        dtype=np.float32,
+    )
+    gx = ndi.convolve(
+        gray01.astype(np.float32),
+        sx,
+        mode="reflect",
+    )
+    gy = ndi.convolve(
+        gray01.astype(np.float32),
+        sy,
+        mode="reflect",
+    )
     return np.sqrt(gx * gx + gy * gy + 1e-6).astype(np.float32)
 
 
-def robust_normalize(arr: np.ndarray, q_low: float = 0.02, q_high: float = 0.98, eps: float = 1e-6) -> np.ndarray:
+def robust_normalize(
+    arr: np.ndarray,
+    q_low: float = 0.02,
+    q_high: float = 0.98,
+    eps: float = 1e-6,
+) -> np.ndarray:
     arr = np.asarray(arr, dtype=np.float32)
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     lo = float(np.quantile(arr, q_low))
     hi = float(np.quantile(arr, q_high))
+
     if abs(hi - lo) < eps:
         mn = float(arr.min())
         mx = float(arr.max())
         if abs(mx - mn) < eps:
             return np.zeros_like(arr, dtype=np.float32)
-        return np.clip((arr - mn) / (mx - mn + eps), 0.0, 1.0)
-    return np.clip((arr - lo) / (hi - lo + eps), 0.0, 1.0)
+        return np.clip(
+            (arr - mn) / (mx - mn + eps),
+            0.0,
+            1.0,
+        )
 
-
-def compute_t2_building_support(t2_rgb_u8: np.ndarray) -> np.ndarray:
-    rgb = t2_rgb_u8.astype(np.float32) / 255.0
-    gray = rgb.mean(axis=2)
-    edge = _gradient_magnitude(gray)
-    lap = np.abs(gray - ndi.uniform_filter(gray, size=5)).astype(np.float32)
-    local_mean = ndi.uniform_filter(gray, size=11)
-    local_var = ndi.uniform_filter((gray - local_mean) ** 2, size=11)
-    local_std = np.sqrt(np.maximum(local_var, 1e-8)).astype(np.float32)
-
-    bright = robust_normalize(gray)
-    edge_n = robust_normalize(edge)
-    lap_n = robust_normalize(lap)
-    std_n = robust_normalize(local_std)
-    diffuse_penalty = robust_normalize(np.maximum(0.0, std_n - 0.65 * edge_n))
-
-    support = robust_normalize(
-        0.42 * edge_n + 0.28 * lap_n + 0.18 * bright + 0.12 * std_n - 0.18 * diffuse_penalty
+    return np.clip(
+        (arr - lo) / (hi - lo + eps),
+        0.0,
+        1.0,
     )
-    return support
 
 
-def compute_temporal_delta_support(t1_rgb_u8: np.ndarray, t2_rgb_u8: np.ndarray) -> np.ndarray:
+def compute_temporal_delta_support(
+    t1_rgb_u8: np.ndarray,
+    t2_rgb_u8: np.ndarray,
+) -> np.ndarray:
+    """Historical visual temporal-delta map; never modifies predictions."""
     t1 = t1_rgb_u8.astype(np.float32) / 255.0
     t2 = t2_rgb_u8.astype(np.float32) / 255.0
+
     diff_rgb = np.abs(t2 - t1).mean(axis=2)
+
     g1 = t1.mean(axis=2)
     g2 = t2.mean(axis=2)
+
     e1 = _gradient_magnitude(g1)
     e2 = _gradient_magnitude(g2)
     edge_diff = np.abs(e2 - e1)
-    delta = robust_normalize(0.68 * robust_normalize(diff_rgb) + 0.32 * robust_normalize(edge_diff))
+
+    delta = robust_normalize(
+        0.68 * robust_normalize(diff_rgb)
+        + 0.32 * robust_normalize(edge_diff)
+    )
     return delta
 
 
-def remove_small_components(mask: np.ndarray, min_region_size: int = 28) -> np.ndarray:
-    mask = (mask > 0).astype(np.uint8)
-    labeled, num = ndi.label(mask)
-    if num == 0:
-        return mask
-    out = np.zeros_like(mask, dtype=np.uint8)
-    sizes = ndi.sum(mask, labeled, index=np.arange(1, num + 1))
-    for i, area in enumerate(sizes, start=1):
-        if area >= min_region_size:
-            out[labeled == i] = 1
-    return out
+# ---------------------------------------------------------------------------
+# Official report + prediction manifest
+# ---------------------------------------------------------------------------
+
+def load_json(path: Path) -> Dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"Expected JSON object: {path}")
+    return raw
 
 
-def component_table(mask: np.ndarray, prob: np.ndarray, building_support: np.ndarray, border_band: int = 12):
-    mask = (mask > 0).astype(np.uint8)
-    labeled, num = ndi.label(mask)
-    h, w = mask.shape
-    rows = []
-    for i in range(1, num + 1):
-        comp = labeled == i
-        area = int(comp.sum())
-        if area <= 0:
-            continue
-        ys, xs = np.where(comp)
-        y0, y1 = int(ys.min()), int(ys.max())
-        x0, x1 = int(xs.min()), int(xs.max())
-        bh = int(y1 - y0 + 1)
-        bw = int(x1 - x0 + 1)
-        bbox_area = float(bh * bw)
-        fill_ratio = float(area) / max(1.0, bbox_area)
-        elongation = float(max(bh, bw)) / max(1.0, float(min(bh, bw)))
-        border_touch = 1.0 if (y0 < border_band or x0 < border_band or y1 >= h - border_band or x1 >= w - border_band) else 0.0
-        pvals = prob[comp]
-        bvals = building_support[comp]
-        prob_mean = float(pvals.mean()) if pvals.size else 0.0
-        prob_max = float(pvals.max()) if pvals.size else 0.0
-        prob_q90 = float(np.quantile(pvals, 0.90)) if pvals.size else 0.0
-        build_mean = float(bvals.mean()) if bvals.size else 0.0
-        build_max = float(bvals.max()) if bvals.size else 0.0
-        thin_penalty = max(0.0, min(1.0, (0.22 - fill_ratio) / 0.22)) * min(1.0, max(0.0, (elongation - 2.2) / 3.0))
-        score = (
-            0.28 * prob_mean
-            + 0.24 * prob_max
-            + 0.15 * prob_q90
-            + 0.15 * build_mean
-            + 0.08 * build_max
-            + 0.08 * min(1.0, area / 320.0)
-            + 0.05 * min(1.0, fill_ratio / 0.50)
-            - 0.14 * thin_penalty
-            - 0.06 * border_touch * max(0.0, 0.22 - build_mean) / 0.22
-        )
-        rows.append(
-            {
-                "id": i,
-                "area": area,
-                "prob_mean": prob_mean,
-                "prob_max": prob_max,
-                "prob_q90": prob_q90,
-                "build_mean": build_mean,
-                "build_max": build_max,
-                "fill_ratio": fill_ratio,
-                "elongation": elongation,
-                "bbox_h": bh,
-                "bbox_w": bw,
-                "border_touch": border_touch,
-                "score": float(score),
-            }
-        )
-    return labeled, rows
+def load_official_report(path: Path) -> Dict[str, Any]:
+    report = load_json(path)
+    evaluation = report.get("evaluation")
 
-
-def infer_osm_group_boost(osm_resolved) -> float:
-    if osm_resolved is None:
-        return 0.0
-    txt = " ".join([str(osm_resolved.get("main_text", ""))] + list(osm_resolved.get("osm_texts", []))).lower()
-    boost = 0.0
-    for kw, val in [
-        ("residential", 0.18),
-        ("industrial", 0.16),
-        ("commercial", 0.12),
-        ("built-up", 0.12),
-        ("building", 0.14),
-        ("transport", 0.10),
-        ("road", 0.10),
-        ("neighborhood", 0.10),
-        ("urban", 0.12),
-    ]:
-        if kw in txt:
-            boost += val
-    if "water-related" in txt or "open area" in txt or "sparse undeveloped" in txt:
-        boost -= 0.08
-    return float(np.clip(boost, 0.0, 0.42))
-
-
-def complete_buildings_osm_group(
-    prob: np.ndarray,
-    t2_building_support: np.ndarray,
-    temporal_delta: np.ndarray,
-    fixed_threshold: float,
-    keep_top_ratio: float,
-    min_region_size: int,
-    osm_group_boost: float,
-) -> np.ndarray:
-    prob = robust_normalize(prob)
-    t2_building_support = robust_normalize(t2_building_support)
-    temporal_delta = robust_normalize(temporal_delta)
-
-    q_seed = float(np.quantile(prob, 0.988))
-    seed_thr = max(float(fixed_threshold) + 0.05 - 0.02 * osm_group_boost, q_seed - 0.02 * osm_group_boost)
-    seed = (prob >= seed_thr).astype(np.uint8)
-    if seed.sum() == 0:
-        seed_thr = float(np.quantile(prob, 0.994))
-        seed = (prob >= seed_thr).astype(np.uint8)
-
-    q_support = float(np.quantile(prob, 1.0 - float(np.clip(max(keep_top_ratio, 0.06), 1e-4, 0.95))))
-    support_thr = max(0.14, min(0.36, q_support - 0.05 * osm_group_boost))
-    support = (prob >= support_thr).astype(np.uint8)
-
-    build_thr_hi = max(0.34, float(np.quantile(t2_building_support, 0.84)) - 0.08 * osm_group_boost)
-    build_thr_lo = max(0.22, float(np.quantile(t2_building_support, 0.72)) - 0.08 * osm_group_boost)
-    delta_thr_lo = max(0.10, float(np.quantile(temporal_delta, 0.58)) - 0.02)
-
-    candidate = (t2_building_support >= build_thr_hi).astype(np.uint8)
-    candidate = ndi.binary_opening(candidate.astype(bool), structure=np.ones((3, 3), dtype=np.uint8), iterations=1).astype(np.uint8)
-    candidate = ndi.binary_closing(candidate.astype(bool), structure=np.ones((3, 3), dtype=np.uint8), iterations=1).astype(np.uint8)
-    candidate = ndi.binary_fill_holes(candidate).astype(np.uint8)
-
-    support_mask = (
-        ((support > 0) & (t2_building_support >= build_thr_lo) & (temporal_delta >= delta_thr_lo))
-        | ((prob >= max(support_thr + 0.03, 0.18)) & (t2_building_support >= max(0.18, build_thr_lo - 0.05)))
-    ).astype(np.uint8)
-
-    grown = ndi.binary_propagation(seed.astype(bool), mask=support_mask.astype(bool)).astype(np.uint8)
-    grown = remove_small_components(grown, min_region_size=min_region_size)
-
-    cand_labeled, _ = ndi.label(candidate > 0)
-    labeled, num = ndi.label(grown > 0)
-    if num == 0:
-        return np.zeros_like(grown, dtype=np.uint8)
-
-    out = np.zeros_like(grown, dtype=np.uint8)
-    max_growth_ratio = 1.75 + 0.75 * osm_group_boost
-    min_overlap_ratio = max(0.07, 0.12 - 0.06 * osm_group_boost)
-
-    for i in range(1, num + 1):
-        comp = labeled == i
-        area = int(comp.sum())
-        if area < int(min_region_size):
-            continue
-
-        ys, xs = np.where(comp)
-        if len(ys) == 0:
-            continue
-        y0 = max(0, int(ys.min()) - 4)
-        y1 = min(comp.shape[0], int(ys.max()) + 5)
-        x0 = max(0, int(xs.min()) - 4)
-        x1 = min(comp.shape[1], int(xs.max()) + 5)
-
-        comp_patch = comp[y0:y1, x0:x1]
-        prob_patch = prob[y0:y1, x0:x1]
-        build_patch = t2_building_support[y0:y1, x0:x1]
-        delta_patch = temporal_delta[y0:y1, x0:x1]
-
-        final_comp = comp_patch.copy()
-        overlap_ids = np.unique(cand_labeled[y0:y1, x0:x1][comp_patch])
-        overlap_ids = overlap_ids[overlap_ids > 0]
-
-        best_score = -1e9
-        best_union = None
-        for cid in overlap_ids:
-            cand = cand_labeled[y0:y1, x0:x1] == int(cid)
-            cand_area = float(cand.sum())
-            if cand_area < float(min_region_size):
-                continue
-            overlap = float((cand & comp_patch).sum())
-            if overlap <= 0:
-                continue
-            overlap_ratio = overlap / max(1.0, cand_area)
-            union = cand | comp_patch
-            union_area = float(union.sum())
-            growth_ratio = union_area / max(1.0, float(comp_patch.sum()))
-            extra = union & (~comp_patch)
-            extra_area = float(extra.sum())
-            if growth_ratio > max_growth_ratio:
-                continue
-            if overlap_ratio < min_overlap_ratio and overlap < 10:
-                continue
-            extra_prob_mean = float(prob_patch[extra].mean()) if extra_area > 0 else 0.0
-            extra_build_mean = float(build_patch[extra].mean()) if extra_area > 0 else 0.0
-            extra_delta_mean = float(delta_patch[extra].mean()) if extra_area > 0 else 0.0
-            core_prob_mean = float(prob_patch[comp_patch].mean())
-            if extra_area > 0 and extra_prob_mean < (0.09 - 0.02 * osm_group_boost) and extra_build_mean < (build_thr_hi - 0.05) and extra_delta_mean < (delta_thr_lo - 0.02):
-                continue
-            score = (
-                2.0 * overlap_ratio
-                + 0.95 * core_prob_mean
-                + 0.75 * extra_prob_mean
-                + 0.55 * extra_build_mean
-                + 0.45 * extra_delta_mean
-                - 0.65 * max(0.0, growth_ratio - 1.0)
-            )
-            if score > best_score:
-                best_score = score
-                best_union = union
-
-        if best_union is not None:
-            final_comp = best_union
-
-        final_comp = ndi.binary_closing(final_comp, structure=np.ones((3, 3), dtype=np.uint8), iterations=1)
-        final_comp = ndi.binary_fill_holes(final_comp)
-        local_gate = (
-            (prob_patch >= max(0.11, support_thr - 0.05))
-            | ((build_patch >= build_thr_lo) & (delta_patch >= max(0.08, delta_thr_lo - 0.03)))
-        )
-        final_comp = final_comp & local_gate
-        if int(final_comp.sum()) < int(min_region_size):
-            continue
-        out[y0:y1, x0:x1] |= final_comp.astype(np.uint8)
-
-    out = remove_small_components(out, min_region_size=min_region_size)
-    return out.astype(np.uint8)
-
-
-def connect_nearby_urban_components(mask: np.ndarray, prob: np.ndarray, building_support: np.ndarray, temporal_delta: np.ndarray, osm_group_boost: float, min_region_size: int) -> np.ndarray:
-    if osm_group_boost <= 0.04:
-        return mask.astype(np.uint8)
-
-    labeled, rows = component_table(mask, prob, building_support)
-    if len(rows) < 2:
-        return mask.astype(np.uint8)
-
-    max_gap = int(2 + round(3 * osm_group_boost))
-    build_gate = max(0.24, 0.34 - 0.08 * osm_group_boost)
-    prob_gate = max(0.10, 0.16 - 0.04 * osm_group_boost)
-    delta_gate = max(0.08, float(np.quantile(temporal_delta, 0.58)) - 0.02)
-
-    out = mask.astype(np.uint8).copy()
-    rows_sorted = sorted(rows, key=lambda r: (r["area"], r["score"]), reverse=True)
-    keep_ids = [int(r["id"]) for r in rows_sorted[: max(4, min(10, len(rows_sorted)))]]
-
-    for i, cid_a in enumerate(keep_ids):
-        comp_a = labeled == cid_a
-        dil_a = ndi.binary_dilation(comp_a, iterations=max_gap)
-        for cid_b in keep_ids[i + 1:]:
-            comp_b = labeled == cid_b
-            if not np.any(dil_a & comp_b):
-                continue
-            union = comp_a | comp_b
-            bridge = ndi.binary_closing(union, structure=np.ones((3 + max_gap, 3 + max_gap), dtype=np.uint8), iterations=1)
-            extra = bridge & (~union)
-            if extra.sum() == 0:
-                out[bridge] = 1
-                continue
-            extra_prob = float(prob[extra].mean()) if extra.sum() else 0.0
-            extra_build = float(building_support[extra].mean()) if extra.sum() else 0.0
-            extra_delta = float(temporal_delta[extra].mean()) if extra.sum() else 0.0
-            if extra_delta >= delta_gate and (extra_build >= build_gate or (extra_build >= build_gate - 0.05 and extra_prob >= prob_gate)):
-                out[bridge] = 1
-
-    out = ndi.binary_closing(out.astype(bool), structure=np.ones((3, 3), dtype=np.uint8), iterations=1).astype(np.uint8)
-    out = remove_small_components(out, min_region_size=min_region_size)
-    return out
-
-
-def precision_refine_components(mask: np.ndarray, prob: np.ndarray, building_support: np.ndarray, temporal_delta: np.ndarray, min_region_size: int, gate_prob_floor: float, gate_build_floor: float) -> np.ndarray:
-    labeled, rows = component_table(mask, prob, building_support)
-    if not rows:
-        return np.zeros_like(mask, dtype=np.uint8)
-
-    out = np.zeros_like(mask, dtype=np.uint8)
-    for row in rows:
-        cid = int(row["id"])
-        comp = labeled == cid
-        ys, xs = np.where(comp)
-        if len(ys) == 0:
-            continue
-        y0 = max(0, int(ys.min()) - 2)
-        y1 = min(mask.shape[0], int(ys.max()) + 3)
-        x0 = max(0, int(xs.min()) - 2)
-        x1 = min(mask.shape[1], int(xs.max()) + 3)
-        comp_patch = comp[y0:y1, x0:x1]
-        p = prob[y0:y1, x0:x1]
-        b = building_support[y0:y1, x0:x1]
-        d = temporal_delta[y0:y1, x0:x1]
-        comp_p = p[comp_patch]
-        comp_b = b[comp_patch]
-        if comp_p.size == 0:
-            continue
-
-        adaptive_prob = max(gate_prob_floor, float(np.quantile(comp_p, 0.35)))
-        adaptive_build = max(gate_build_floor, float(np.quantile(comp_b, 0.45)))
-        delta_floor = max(0.08, float(np.quantile(d[comp_patch], 0.30)) if int(comp_patch.sum()) > 0 else 0.08)
-
-        keep_gate = (
-            (p >= adaptive_prob)
-            | ((b >= adaptive_build) & (d >= delta_floor))
-            | ((p >= max(0.10, adaptive_prob - 0.06)) & (d >= max(0.06, delta_floor - 0.03)))
-        )
-        refined = comp_patch & keep_gate
-        refined = ndi.binary_opening(refined, structure=np.ones((2, 2), dtype=np.uint8), iterations=1)
-        refined = ndi.binary_closing(refined, structure=np.ones((3, 3), dtype=np.uint8), iterations=1)
-        refined = ndi.binary_fill_holes(refined)
-        refined = refined & (
-            (p >= max(0.09, adaptive_prob - 0.08))
-            | ((b >= max(0.28, adaptive_build - 0.08)) & (d >= max(0.06, delta_floor - 0.03)))
+    if not isinstance(evaluation, dict):
+        raise RuntimeError(
+            f"Official report has no 'evaluation' object: {path}"
         )
 
-        if int(refined.sum()) < int(min_region_size):
-            refined = comp_patch
-        out[y0:y1, x0:x1] |= refined.astype(np.uint8)
-
-    return remove_small_components(out.astype(np.uint8), min_region_size=min_region_size)
+    return report
 
 
-def patch_level_false_positive_veto(mask: np.ndarray, prob: np.ndarray, global_map: np.ndarray, building_support: np.ndarray, temporal_delta: np.ndarray) -> bool:
-    if int(mask.sum()) == 0:
-        return False
+def load_prediction_manifest(prediction_dir: Path) -> Dict[str, Any]:
+    manifest_path = prediction_dir / "prediction_manifest.json"
 
-    pred_ratio = float(mask.mean())
-    prob_mean = float(prob.mean())
-    prob_peak = float(np.quantile(prob, 0.997))
-    global_mean = float(global_map.mean())
-    pred_build_mean = float(building_support[mask > 0].mean()) if np.any(mask > 0) else 0.0
-    pred_delta_mean = float(temporal_delta[mask > 0].mean()) if np.any(mask > 0) else 0.0
-
-    labeled, num = ndi.label(mask > 0)
-    if num == 0:
-        return False
-
-    sizes = np.asarray(ndi.sum((mask > 0).astype(np.uint8), labeled, index=np.arange(1, num + 1)), dtype=np.float32)
-    max_area = float(sizes.max()) if sizes.size else 0.0
-    mean_area = float(sizes.mean()) if sizes.size else 0.0
-
-    border = np.zeros_like(mask, dtype=np.uint8)
-    b = 12
-    border[:b, :] = 1
-    border[-b:, :] = 1
-    border[:, :b] = 1
-    border[:, -b:] = 1
-    pred_border_ratio = float(((mask > 0) & (border > 0)).sum()) / max(1.0, float(border.sum()))
-
-    compact_confident = (
-        max_area >= 1800.0
-        and pred_ratio >= 0.004
-        and pred_build_mean >= 0.34
-        and (pred_delta_mean >= 0.34 or prob_peak >= 0.80)
-    )
-    widespread_structured = (
-        pred_ratio >= 0.020
-        and mean_area >= 400.0
-        and pred_build_mean >= 0.40
-        and pred_delta_mean >= 0.40
-    )
-
-    suspicious_sparse_structured = (
-        pred_ratio < 0.018
-        and num >= 6
-        and max_area < 3200.0
-        and prob_mean < 0.010
-        and global_mean < 0.55
-        and pred_border_ratio < 0.04
-        and pred_build_mean >= 0.62
-        and pred_delta_mean >= 0.58
-    )
-
-    suspicious_compact_wrongloc = (
-        pred_ratio < 0.012
-        and num <= 12
-        and max_area < 1600.0
-        and global_mean >= 0.65
-        and prob_mean < 0.020
-        and prob_peak >= 0.70
-        and pred_build_mean < 0.50
-        and pred_delta_mean < 0.55
-    )
-
-    suspicious_weak_global = (
-        pred_ratio < 0.010
-        and global_mean < 0.20
-        and prob_peak < 0.12
-        and pred_delta_mean < 0.22
-    )
-
-    if compact_confident or widespread_structured:
-        return False
-
-    return bool(suspicious_sparse_structured or suspicious_compact_wrongloc or suspicious_weak_global)
-
-
-def precision_strict_filter(
-    mask: np.ndarray,
-    prob: np.ndarray,
-    building_support: np.ndarray,
-    temporal_delta: np.ndarray,
-    global_map: np.ndarray,
-    min_region_size: int,
-    strong_keep_area: int,
-    component_score_thr: float,
-    line_fill_ratio_thr: float,
-    line_elongation_thr: float,
-    line_build_max_thr: float,
-    line_prob_mean_thr: float,
-    max_components_keep: int,
-) -> np.ndarray:
-    labeled, rows = component_table(mask, prob, building_support)
-    if not rows:
-        return np.zeros_like(mask, dtype=np.uint8)
-
-    rows_sorted = sorted(rows, key=lambda r: (float(r["score"]), float(r["prob_max"]), float(r["area"])), reverse=True)
-    out = np.zeros_like(mask, dtype=np.uint8)
-    kept = 0
-
-    for row in rows_sorted:
-        cid = int(row["id"])
-        area = int(row["area"])
-        score = float(row["score"])
-        prob_mean = float(row["prob_mean"])
-        prob_max = float(row["prob_max"])
-        prob_q90 = float(row["prob_q90"])
-        build_mean = float(row["build_mean"])
-        build_max = float(row["build_max"])
-        fill_ratio = float(row["fill_ratio"])
-        elongation = float(row["elongation"])
-        border_touch = float(row["border_touch"])
-        comp = labeled == cid
-        delta_mean = float(temporal_delta[comp].mean()) if int(comp.sum()) > 0 else 0.0
-        global_local_mean = float(global_map[comp].mean()) if int(comp.sum()) > 0 else 0.0
-
-        line_like = (
-            fill_ratio < line_fill_ratio_thr
-            and elongation > line_elongation_thr
-            and build_max < line_build_max_thr
-            and prob_mean < line_prob_mean_thr
-            and delta_mean < 0.14
-        )
-        weak_border_line = (
-            border_touch > 0.5
-            and fill_ratio < max(0.12, line_fill_ratio_thr - 0.04)
-            and elongation > max(2.8, line_elongation_thr - 0.8)
-            and build_mean < 0.30
-            and prob_mean < 0.20
-            and delta_mean < 0.14
-        )
-        tiny_weak = area < max(min_region_size * 3, 96) and score < max(component_score_thr + 0.01, 0.33) and delta_mean < 0.12
-
-        sparse_structured_fp = (
-            area < 2600
-            and fill_ratio < 0.42
-            and build_mean >= 0.62
-            and delta_mean >= 0.56
-            and prob_mean < 0.035
-            and global_local_mean < 0.58
-        )
-        compact_wrongloc_fp = (
-            area < 1700
-            and fill_ratio >= 0.45
-            and elongation < 2.2
-            and prob_mean < 0.05
-            and prob_q90 >= 0.50
-            and build_mean < 0.50
-            and delta_mean < 0.55
-            and global_local_mean >= 0.60
-        )
-        fragmented_rural_fp = (
-            area < 1200
-            and fill_ratio < 0.36
-            and build_mean >= 0.68
-            and delta_mean >= 0.62
-            and prob_mean < 0.018
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing prediction manifest: {manifest_path}"
         )
 
-        # V2 minimale : terminer le nettoyage des petits résidus faux positifs
-        small_residual_structured_fp = (
-            area < 2800
-            and prob_mean < 0.025
-            and prob_q90 < 0.22
-            and global_local_mean < 0.52
-            and (
-                (build_mean >= 0.60 and delta_mean >= 0.58)
-                or (area < 1200 and prob_max < 0.18)
-            )
+    manifest = load_json(manifest_path)
+    archives = manifest.get("archives")
+
+    if not isinstance(archives, list) or not archives:
+        raise RuntimeError(
+            f"prediction_manifest.json has no non-empty 'archives' list: "
+            f"{manifest_path}"
         )
 
-        keep = False
-        if area >= int(strong_keep_area) and (prob_mean >= 0.15 or build_mean >= 0.34):
-            keep = True
-        elif area >= max(112, min_region_size * 4) and score >= max(component_score_thr - 0.01, 0.30) and fill_ratio >= 0.15:
-            keep = True
-        elif score >= max(component_score_thr + 0.04, 0.36) and prob_max >= 0.36 and build_max >= 0.32:
-            keep = True
-        elif fill_ratio >= 0.26 and build_mean >= 0.36 and prob_mean >= 0.18 and area >= max(84, min_region_size * 3):
-            keep = True
-        elif prob_max >= 0.60 and prob_mean >= 0.20 and area >= max(56, min_region_size * 2):
-            keep = True
-
-        if line_like or weak_border_line or tiny_weak or sparse_structured_fp or compact_wrongloc_fp or fragmented_rural_fp or small_residual_structured_fp:
-            keep = False
-
-        if keep:
-            out[comp] = 1
-            kept += 1
-            if kept >= int(max_components_keep) and area < int(strong_keep_area):
-                break
-
-    out = remove_small_components(out, min_region_size=min_region_size)
-
-    if patch_level_false_positive_veto(out, prob, global_map, building_support, temporal_delta):
-        out[:] = 0
-
-    return out
+    return manifest
 
 
-def soft_no_change_veto(mask: np.ndarray, prob: np.ndarray, global_map: np.ndarray, temporal_delta: np.ndarray, global_thr: float, prob_mean_thr: float, peak_thr: float) -> bool:
-    if int(mask.sum()) == 0:
-        return True
-    pred_ratio = float(mask.mean())
-    global_mean = float(global_map.mean())
-    prob_mean = float(prob.mean())
-    peak = float(np.quantile(prob, 0.997))
-    delta_mean = float(temporal_delta[mask > 0].mean()) if np.any(mask > 0) else 0.0
+def canonical_manifest_rows(
+    prediction_dir: Path,
+    manifest: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen_scene_ids = set()
+    seen_archives = set()
 
-    return (
-        global_mean < max(0.15, global_thr - 0.03)
-        and prob_mean < max(0.020, prob_mean_thr - 0.006)
-        and peak < max(0.18, peak_thr - 0.04)
-        and delta_mean < 0.14
-        and pred_ratio < 0.040
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt_path", type=str, required=True)
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--split", type=str, default="test", choices=["train", "val", "test"])
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--model_input_size", type=int, default=256)
-    parser.add_argument("--tile_size", type=int, default=256)
-    parser.add_argument("--tile_stride", type=int, default=128)
-    parser.add_argument("--fixed_threshold", type=float, default=0.50)
-    parser.add_argument("--keep_top_ratio", type=float, default=0.05)
-    parser.add_argument("--min_region_size", type=int, default=28)
-    parser.add_argument("--border_band", type=int, default=24)
-    parser.add_argument("--binary_overlay_alpha", type=float, default=0.55)
-    parser.add_argument("--nochange_global_thr", type=float, default=0.21)
-    parser.add_argument("--nochange_prob_mean_thr", type=float, default=0.028)
-    parser.add_argument("--nochange_peak_thr", type=float, default=0.24)
-    parser.add_argument("--strong_keep_area", type=int, default=220)
-    parser.add_argument("--component_score_thr", type=float, default=0.31)
-    parser.add_argument("--precision_gate_prob", type=float, default=0.20)
-    parser.add_argument("--precision_gate_build", type=float, default=0.38)
-    parser.add_argument("--max_components_nochange", type=int, default=4)
-    parser.add_argument("--max_components_keep", type=int, default=5)
-    parser.add_argument("--line_fill_ratio_thr", type=float, default=0.16)
-    parser.add_argument("--line_elongation_thr", type=float, default=3.6)
-    parser.add_argument("--line_build_max_thr", type=float, default=0.40)
-    parser.add_argument("--line_prob_mean_thr", type=float, default=0.19)
-    parser.add_argument("--dominant_component_ratio_thr", type=float, default=0.34)
-    parser.add_argument("--levir_osm_texts_json", type=str, default="")
-    parser.add_argument("--disable_osm", action="store_true")
-    parser.add_argument("--panel_title_bar_h", type=int, default=40)
-    parser.add_argument("--panel_font_size", type=int, default=18)
-    args = parser.parse_args()
-
-    out_dir = Path(args.output_dir)
-    for sub in [
-        "npz", "panels", "preview_t1", "preview_t2", "prob", "mask_raw", "mask_precision", "mask",
-        "gt_mask", "overlay_pred_raw", "overlay_pred_precision", "overlay_pred", "overlay_gt",
-        "global_prob_map", "building_support", "temporal_delta",
-    ]:
-        ensure_dir(str(out_dir / sub))
-
-    cfg = build_cfg(args)
-    osm_json = str(args.levir_osm_texts_json or cfg.get("levir_osm_texts_json", "")).strip()
-    if bool(args.disable_osm) or not osm_json:
-        osm_helper = None
-    else:
-        osm_helper = LEVIROSMHelper(
-            osm_texts_json=osm_json,
-            osm_text_mode=str(cfg.get("levir_osm_text_mode", "concat")),
-            osm_max_phrases=int(cfg.get("levir_osm_max_phrases", 3)),
-            osm_text_key=str(cfg.get("levir_osm_text_key", "text_v21")),
-            osm_fallback_text=str(cfg.get("levir_osm_fallback_text", "no_osm_context")),
-            osm_compose_mode=str(cfg.get("levir_osm_compose_mode", "signature_compact")),
-            osm_word_budget=int(cfg.get("levir_osm_word_budget", 32)),
-            osm_joiner=str(cfg.get("levir_osm_joiner", " ; ")),
-            osm_include_source_text=bool(cfg.get("levir_osm_include_source_text", False)),
-        )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ViLTransformerSS(cfg)
-    model.eval().to(device)
-    ckpt = torch.load(args.ckpt_path, map_location="cpu")
-    state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"[INFO] Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
-
-    triplets = list_split_triplets(
-        args.data_root,
-        args.split,
-        cfg.get("levir_image_a_dirname", "A"),
-        cfg.get("levir_image_b_dirname", "B"),
-        cfg.get("levir_label_dirname", "label"),
-    )
-    tile = int(args.tile_size)
-    stride = int(args.tile_stride)
-    hann = build_hann_window(tile)
-    rows = []
-
-    with torch.no_grad():
-        for patch_id, path_a, path_b, path_l in tqdm(triplets, desc=f"Safe export {args.split}"):
-            t1_full = np.asarray(Image.open(path_a).convert("RGB"), dtype=np.uint8)
-            t2_full = np.asarray(Image.open(path_b).convert("RGB"), dtype=np.uint8)
-            gt_full = (np.asarray(Image.open(path_l).convert("L"), dtype=np.uint8) > 127).astype(np.uint8)
-
-            osm_resolved = _resolve_osm(osm_helper, patch_id, fallback_text=str(cfg.get("levir_fixed_text", "building change detection")))
-            osm_group_boost = infer_osm_group_boost(osm_resolved)
-
-            h, w = gt_full.shape
-            ys = tile_positions(h, tile, stride)
-            xs = tile_positions(w, tile, stride)
-            prob_sum = np.zeros((h, w), dtype=np.float32)
-            gp_sum = np.zeros((h, w), dtype=np.float32)
-            weight_sum = np.zeros((h, w), dtype=np.float32)
-
-            for y in ys:
-                for x in xs:
-                    t1_tile = t1_full[y:y + tile, x:x + tile]
-                    t2_tile = t2_full[y:y + tile, x:x + tile]
-                    if t1_tile.shape[0] != tile or t1_tile.shape[1] != tile:
-                        pad_h = tile - t1_tile.shape[0]
-                        pad_w = tile - t1_tile.shape[1]
-                        t1_tile = np.pad(t1_tile, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
-                        t2_tile = np.pad(t2_tile, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
-
-                    in_t1 = resize_rgb(t1_tile, args.model_input_size) if tile != args.model_input_size else t1_tile
-                    in_t2 = resize_rgb(t2_tile, args.model_input_size) if tile != args.model_input_size else t2_tile
-
-                    batch = make_batch_from_tiles(
-                        in_t1,
-                        in_t2,
-                        device,
-                        patch_id=patch_id,
-                        osm_helper=osm_helper,
-                        osm_resolved=osm_resolved,
-                        fallback_text=str(cfg.get("levir_fixed_text", "building change detection")),
-                    )
-                    infer = model.infer(batch, mask_text=False, mask_image=False)
-                    tile_prob = infer["change_refined_map_up"][0].detach().cpu().numpy().astype(np.float32)
-                    global_prob = float(infer["change_probs_global"][0, 0].detach().cpu().item())
-                    if tile_prob.shape != (tile, tile):
-                        tile_prob = resize_prob(tile_prob, (tile, tile))
-
-                    yy = min(tile, h - y)
-                    xx = min(tile, w - x)
-                    prob_sum[y:y + yy, x:x + xx] += tile_prob[:yy, :xx] * hann[:yy, :xx]
-                    gp_sum[y:y + yy, x:x + xx] += global_prob * hann[:yy, :xx]
-                    weight_sum[y:y + yy, x:x + xx] += hann[:yy, :xx]
-
-            prob = prob_sum / np.maximum(weight_sum, 1e-6)
-            global_map = gp_sum / np.maximum(weight_sum, 1e-6)
-            building_support = compute_t2_building_support(t2_full)
-            temporal_delta = compute_temporal_delta_support(t1_full, t2_full)
-
-            raw_mask = complete_buildings_osm_group(
-                prob, building_support, temporal_delta, args.fixed_threshold, args.keep_top_ratio, args.min_region_size, osm_group_boost
-            )
-            raw_mask = connect_nearby_urban_components(raw_mask, prob, building_support, temporal_delta, osm_group_boost, args.min_region_size)
-
-            precision_mask = precision_refine_components(
-                raw_mask, prob, building_support, temporal_delta, args.min_region_size,
-                max(0.16, args.precision_gate_prob - 0.04 * osm_group_boost),
-                max(0.30, args.precision_gate_build - 0.08 * osm_group_boost),
+    for item in manifest["archives"]:
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                "Invalid non-object archive entry in prediction manifest."
             )
 
-            dynamic_max_keep = int(args.max_components_keep + round(6 * osm_group_boost))
-            final_mask = precision_strict_filter(
-                precision_mask, prob, building_support, temporal_delta, global_map, args.min_region_size,
-                max(int(args.strong_keep_area * (1.0 - 0.16 * osm_group_boost)), args.min_region_size * 4),
-                max(0.28, args.component_score_thr - 0.04 * osm_group_boost),
-                args.line_fill_ratio_thr,
-                args.line_elongation_thr,
-                args.line_build_max_thr,
-                args.line_prob_mean_thr,
-                dynamic_max_keep,
+        scene_id = str(item.get("scene_id", "")).strip()
+        archive_name = str(item.get("archive", "")).strip()
+
+        if not scene_id:
+            raise RuntimeError(
+                f"Manifest entry has no scene_id: {item}"
+            )
+        if not archive_name:
+            raise RuntimeError(
+                f"Manifest entry has no archive: {item}"
+            )
+        if scene_id in seen_scene_ids:
+            raise RuntimeError(
+                f"Duplicate scene_id in manifest: {scene_id}"
+            )
+        if archive_name in seen_archives:
+            raise RuntimeError(
+                f"Duplicate archive in manifest: {archive_name}"
             )
 
-            if soft_no_change_veto(
-                final_mask, prob, global_map, temporal_delta,
-                args.nochange_global_thr, args.nochange_prob_mean_thr, args.nochange_peak_thr
-            ):
-                final_mask[:] = 0
-
-            overlay_pred_raw = make_binary_overlay(t2_full, raw_mask, alpha=args.binary_overlay_alpha)
-            overlay_pred_precision = make_binary_overlay(t2_full, precision_mask, alpha=args.binary_overlay_alpha)
-            overlay_pred = make_binary_overlay(t2_full, final_mask, alpha=args.binary_overlay_alpha)
-            overlay_gt = make_binary_overlay(t2_full, gt_full, alpha=args.binary_overlay_alpha)
-
-            save_png_rgb(t1_full, str(out_dir / "preview_t1" / f"{patch_id}.png"))
-            save_png_rgb(t2_full, str(out_dir / "preview_t2" / f"{patch_id}.png"))
-            save_png_gray(prob, str(out_dir / "prob" / f"{patch_id}.png"))
-            save_png_gray(global_map, str(out_dir / "global_prob_map" / f"{patch_id}.png"))
-            save_png_gray(building_support, str(out_dir / "building_support" / f"{patch_id}.png"))
-            save_png_gray(temporal_delta, str(out_dir / "temporal_delta" / f"{patch_id}.png"))
-            save_png_binary(raw_mask, str(out_dir / "mask_raw" / f"{patch_id}.png"))
-            save_png_binary(precision_mask, str(out_dir / "mask_precision" / f"{patch_id}.png"))
-            save_png_binary(final_mask, str(out_dir / "mask" / f"{patch_id}.png"))
-            save_png_binary(gt_full, str(out_dir / "gt_mask" / f"{patch_id}.png"))
-            save_png_rgb(overlay_pred_raw, str(out_dir / "overlay_pred_raw" / f"{patch_id}.png"))
-            save_png_rgb(overlay_pred_precision, str(out_dir / "overlay_pred_precision" / f"{patch_id}.png"))
-            save_png_rgb(overlay_pred, str(out_dir / "overlay_pred" / f"{patch_id}.png"))
-            save_png_rgb(overlay_gt, str(out_dir / "overlay_gt" / f"{patch_id}.png"))
-
-            np.savez_compressed(
-                str(out_dir / "npz" / f"{patch_id}.npz"),
-                patch_id=patch_id,
-                gt_mask=gt_full.astype(np.uint8),
-                prob_map=prob.astype(np.float32),
-                global_prob_map=global_map.astype(np.float32),
-                building_support=building_support.astype(np.float32),
-                temporal_delta=temporal_delta.astype(np.float32),
-                pred_mask_fused_semantic_stable_raw=raw_mask.astype(np.uint8),
-                pred_mask_fused_semantic_stable_precision=precision_mask.astype(np.uint8),
-                pred_mask_fused_semantic_stable_precision_strict=final_mask.astype(np.uint8),
-                osm_group_boost=np.float32(osm_group_boost),
+        archive_path = prediction_dir / archive_name
+        if not archive_path.is_file():
+            raise FileNotFoundError(
+                f"Archive listed by manifest is missing: {archive_path}"
             )
 
-            panel = make_panel(
-                [
-                    ("T1 image", t1_full),
-                    ("T2 image", t2_full),
-                    ("Model probability", np.stack([float01_to_uint8_gray(prob)] * 3, axis=-1)),
-                    ("Temporal delta", np.stack([float01_to_uint8_gray(temporal_delta)] * 3, axis=-1)),
-                    ("Raw mask", np.stack([binary_mask_to_uint8(raw_mask)] * 3, axis=-1)),
-                    ("Precision mask", np.stack([binary_mask_to_uint8(precision_mask)] * 3, axis=-1)),
-                    ("Final mask", np.stack([binary_mask_to_uint8(final_mask)] * 3, axis=-1)),
-                    ("Prediction overlay", overlay_pred),
-                    ("GT overlay", overlay_gt),
-                ],
-                pad=8,
-                title_bar_h=int(args.panel_title_bar_h),
-                font_size=int(args.panel_font_size),
-            )
-            save_png_rgb(panel, str(out_dir / "panels" / f"{patch_id}.png"))
+        source_height = int(item.get("source_height", 0))
+        source_width = int(item.get("source_width", 0))
 
-            rows.append(
+        if source_height <= 0 or source_width <= 0:
+            raise RuntimeError(
+                f"Invalid source dimensions for {scene_id}: "
+                f"{source_height} x {source_width}"
+            )
+
+        row = dict(item)
+        row["scene_id"] = scene_id
+        row["archive"] = archive_name
+        row["archive_path"] = archive_path
+        row["source_height"] = source_height
+        row["source_width"] = source_width
+        rows.append(row)
+
+        seen_scene_ids.add(scene_id)
+        seen_archives.add(archive_name)
+
+    rows.sort(key=lambda row: natural_scene_key(row["scene_id"]))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# NPZ probability discovery
+# ---------------------------------------------------------------------------
+
+def safe_read_npz_numeric(
+    npz: np.lib.npyio.NpzFile,
+    key: str,
+) -> Optional[np.ndarray]:
+    """Read one key without letting object metadata invalidate the whole NPZ."""
+    try:
+        arr = npz[key]
+    except Exception:
+        return None
+
+    try:
+        arr = np.asarray(arr)
+    except Exception:
+        return None
+
+    if not np.issubdtype(arr.dtype, np.number):
+        return None
+
+    return arr
+
+
+def squeeze_scene_array(
+    arr: np.ndarray,
+    expected_hw: Tuple[int, int],
+) -> Optional[np.ndarray]:
+    arr = np.squeeze(np.asarray(arr))
+
+    if arr.ndim != 2:
+        return None
+    if tuple(arr.shape) != tuple(expected_hw):
+        return None
+
+    return arr
+
+
+def discover_candidate_keys(
+    first_archive: Path,
+    expected_hw: Tuple[int, int],
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+
+    with np.load(first_archive, allow_pickle=False) as npz:
+        all_keys = list(npz.files)
+
+        for key in all_keys:
+            raw = safe_read_npz_numeric(npz, key)
+            if raw is None:
+                continue
+
+            arr = squeeze_scene_array(raw, expected_hw)
+            if arr is None:
+                continue
+
+            if not np.issubdtype(arr.dtype, np.floating):
+                continue
+
+            arr32 = arr.astype(np.float32, copy=False)
+
+            if not np.isfinite(arr32).all():
+                continue
+
+            amin = float(arr32.min())
+            amax = float(arr32.max())
+
+            # Canonical final scene probability is bounded to [0, 1].
+            if amin < -1e-5 or amax > 1.00001:
+                continue
+
+            candidates.append(
                 {
-                    "patch_id": patch_id,
-                    "osm_group_boost": float(osm_group_boost),
-                    "prob_mean": float(prob.mean()),
-                    "global_mean": float(global_map.mean()),
-                    "temporal_delta_mean": float(temporal_delta.mean()),
-                    "pred_ratio_raw": float(raw_mask.mean()),
-                    "pred_ratio_precision": float(precision_mask.mean()),
-                    "pred_ratio_final": float(final_mask.mean()),
-                    "gt_ratio": float(gt_full.mean()),
+                    "key": key,
+                    "dtype": str(arr.dtype),
+                    "shape": list(arr.shape),
+                    "min": amin,
+                    "max": amax,
+                    "mean": float(arr32.mean()),
                 }
             )
 
-    csv_path = out_dir / "export_summary.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "patch_id",
-            "osm_group_boost",
-            "prob_mean",
-            "global_mean",
-            "temporal_delta_mean",
-            "pred_ratio_raw",
-            "pred_ratio_precision",
-            "pred_ratio_final",
-            "gt_ratio",
+    if not candidates:
+        with np.load(first_archive, allow_pickle=False) as npz:
+            all_keys = list(npz.files)
+
+        raise RuntimeError(
+            "No 2-D floating [0,1] full-scene candidate was found in "
+            f"{first_archive.name}.\nAvailable NPZ keys: {all_keys}"
+        )
+
+    return candidates
+
+
+def load_probability(
+    archive_path: Path,
+    key: str,
+    expected_hw: Tuple[int, int],
+) -> np.ndarray:
+    with np.load(archive_path, allow_pickle=False) as npz:
+        if key not in npz.files:
+            raise KeyError(
+                f"Key '{key}' missing from {archive_path.name}"
+            )
+
+        raw = safe_read_npz_numeric(npz, key)
+
+        if raw is None:
+            raise RuntimeError(
+                f"Key '{key}' is not safely readable numeric data in "
+                f"{archive_path.name}"
+            )
+
+    arr = squeeze_scene_array(raw, expected_hw)
+
+    if arr is None:
+        raise RuntimeError(
+            f"{archive_path.name}:{key} does not have expected shape "
+            f"{expected_hw}; raw shape={np.asarray(raw).shape}"
+        )
+
+    arr = arr.astype(np.float32, copy=False)
+
+    if not np.isfinite(arr).all():
+        raise RuntimeError(
+            f"Non-finite values in {archive_path.name}:{key}"
+        )
+
+    return np.clip(arr, 0.0, 1.0)
+
+
+def preference_rank(key: str) -> Tuple[int, int, str]:
+    lower = key.lower()
+
+    for index, preferred in enumerate(PREFERRED_PROBABILITY_NAMES):
+        if lower == preferred.lower():
+            return 0, index, lower
+
+    if "semantic" in lower and (
+        "prob" in lower or "map" in lower
+    ):
+        return 1, 0, lower
+
+    if "refined" in lower and (
+        "prob" in lower or "map" in lower
+    ):
+        return 1, 1, lower
+
+    if "prob" in lower:
+        return 2, 0, lower
+
+    if any(term in lower for term in LOW_PRIORITY_TERMS):
+        return 4, 0, lower
+
+    return 3, 0, lower
+
+
+# ---------------------------------------------------------------------------
+# Metrics / scientific verification
+# ---------------------------------------------------------------------------
+
+def confusion(
+    pred: np.ndarray,
+    gt: np.ndarray,
+) -> Dict[str, int]:
+    p = np.asarray(pred).astype(bool)
+    g = np.asarray(gt).astype(bool)
+
+    return {
+        "tp": int(np.logical_and(p, g).sum()),
+        "fp": int(np.logical_and(p, ~g).sum()),
+        "fn": int(np.logical_and(~p, g).sum()),
+        "tn": int(np.logical_and(~p, ~g).sum()),
+    }
+
+
+def add_counts(
+    total: Dict[str, int],
+    current: Dict[str, int],
+) -> None:
+    for key in ("tp", "fp", "fn", "tn"):
+        total[key] += int(current[key])
+
+
+def metrics_from_counts(
+    counts: Dict[str, int],
+) -> Dict[str, float]:
+    tp = int(counts["tp"])
+    fp = int(counts["fp"])
+    fn = int(counts["fn"])
+    tn = int(counts["tn"])
+    eps = 1e-12
+
+    return {
+        "iou": tp / (tp + fp + fn + eps),
+        "f1": (2.0 * tp) / (2.0 * tp + fp + fn + eps),
+        "precision": tp / (tp + fp + eps),
+        "recall": tp / (tp + fn + eps),
+        "oa": (tp + tn) / (tp + fp + fn + tn + eps),
+    }
+
+
+def official_confusion(
+    report: Dict[str, Any],
+) -> Dict[str, int]:
+    raw = report["evaluation"]["confusion"]
+
+    return {
+        "tp": int(raw["tp"]),
+        "fp": int(raw["fp"]),
+        "fn": int(raw["fn"]),
+        "tn": int(raw["tn"]),
+    }
+
+
+def count_distance(
+    candidate: Dict[str, int],
+    official: Dict[str, int],
+) -> int:
+    return sum(
+        abs(int(candidate[key]) - int(official[key]))
+        for key in ("tp", "fp", "fn", "tn")
+    )
+
+
+def identify_probability_key(
+    manifest_rows: List[Dict[str, Any]],
+    gt_dir: Path,
+    threshold: float,
+    official_counts: Dict[str, int],
+    diagnostic_path: Path,
+) -> str:
+    first_row = manifest_rows[0]
+    first_archive = Path(first_row["archive_path"])
+    expected_hw = (
+        int(first_row["source_height"]),
+        int(first_row["source_width"]),
+    )
+
+    candidates = discover_candidate_keys(
+        first_archive,
+        expected_hw,
+    )
+
+    print("[DISCOVERY] Full-scene [0,1] candidates:")
+    for candidate in candidates:
+        print(
+            f"  - {candidate['key']} | "
+            f"dtype={candidate['dtype']} | "
+            f"shape={candidate['shape']} | "
+            f"min={candidate['min']:.6f} | "
+            f"max={candidate['max']:.6f} | "
+            f"mean={candidate['mean']:.6f}"
+        )
+
+    diagnostics: List[Dict[str, Any]] = []
+    exact_keys: List[str] = []
+
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        key = str(candidate["key"])
+        total = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        compatible = True
+        failure = ""
+
+        print(
+            f"[DISCOVERY] Verifying {candidate_index}/{len(candidates)}: "
+            f"{key}"
+        )
+
+        for scene_index, row in enumerate(manifest_rows, start=1):
+            scene_id = str(row["scene_id"])
+            archive_path = Path(row["archive_path"])
+            expected_hw = (
+                int(row["source_height"]),
+                int(row["source_width"]),
+            )
+
+            try:
+                prob = load_probability(
+                    archive_path,
+                    key,
+                    expected_hw,
+                )
+            except Exception as exc:
+                compatible = False
+                failure = f"{type(exc).__name__}: {exc}"
+                break
+
+            gt = load_binary(
+                find_scene_file(gt_dir, scene_id)
+            )
+
+            if gt.shape != prob.shape:
+                compatible = False
+                failure = (
+                    f"Shape mismatch {scene_id}: "
+                    f"GT={gt.shape}, prob={prob.shape}"
+                )
+                break
+
+            pred = (prob >= threshold).astype(np.uint8)
+            add_counts(total, confusion(pred, gt))
+
+            if scene_index % 32 == 0 or scene_index == len(manifest_rows):
+                print(
+                    f"    {key}: {scene_index}/"
+                    f"{len(manifest_rows)} scenes"
+                )
+
+        exact = compatible and total == official_counts
+        distance = (
+            count_distance(total, official_counts)
+            if compatible
+            else None
+        )
+
+        diagnostics.append(
+            {
+                "key": key,
+                "first_archive_profile": candidate,
+                "compatible_all_scenes": compatible,
+                "failure": failure,
+                "threshold": threshold,
+                "confusion": total if compatible else None,
+                "official_confusion": official_counts,
+                "absolute_count_distance": distance,
+                "exact_official_confusion_match": exact,
+            }
+        )
+
+        if exact:
+            exact_keys.append(key)
+            print(
+                f"[DISCOVERY][EXACT] {key} reproduces the official "
+                "TEST confusion exactly."
+            )
+        elif compatible:
+            print(
+                f"[DISCOVERY][NO MATCH] {key}: "
+                f"count_distance={distance:,}"
+            )
+        else:
+            print(
+                f"[DISCOVERY][INCOMPATIBLE] {key}: {failure}"
+            )
+
+    diagnostic_path.write_text(
+        json.dumps(
+            {
+                "threshold": threshold,
+                "official_confusion": official_counts,
+                "candidates": diagnostics,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    if not exact_keys:
+        nearest = [
+            row
+            for row in diagnostics
+            if row["compatible_all_scenes"]
+            and row["absolute_count_distance"] is not None
         ]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        nearest.sort(
+            key=lambda row: int(row["absolute_count_distance"])
+        )
+
+        raise RuntimeError(
+            "No NPZ probability array reproduces the official TEST "
+            f"confusion at frozen threshold={threshold}.\n"
+            f"Nearest candidates: "
+            f"{[(row['key'], row['absolute_count_distance']) for row in nearest[:5]]}\n"
+            f"Diagnostic: {diagnostic_path}"
+        )
+
+    exact_keys.sort(key=preference_rank)
+    selected = exact_keys[0]
+
+    if len(exact_keys) > 1:
+        print(
+            "[DISCOVERY] Multiple exact candidates: "
+            f"{exact_keys}. Selected '{selected}' by probability-name "
+            "preference."
+        )
+
+    return selected
+
+
+def verify_official_result(
+    counts: Dict[str, int],
+    metrics: Dict[str, float],
+    report: Dict[str, Any],
+) -> None:
+    expected_counts = official_confusion(report)
+
+    if counts != expected_counts:
+        raise RuntimeError(
+            "Exported masks do NOT reproduce the official confusion.\n"
+            f"Calculated: {counts}\nOfficial:   {expected_counts}"
+        )
+
+    official_metrics = report["evaluation"]["metrics"]
+
+    for key in ("iou", "f1", "precision", "recall", "oa"):
+        local_value = float(metrics[key])
+        official_value = float(official_metrics[key])
+
+        if abs(local_value - official_value) > 1e-12:
+            raise RuntimeError(
+                f"Metric mismatch for {key}: "
+                f"calculated={local_value}, official={official_value}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Error visualization
+# ---------------------------------------------------------------------------
+
+def make_error_map(
+    pred: np.ndarray,
+    gt: np.ndarray,
+) -> np.ndarray:
+    """Black=TN, green=TP, red=FP, blue=FN."""
+    p = np.asarray(pred).astype(bool)
+    g = np.asarray(gt).astype(bool)
+
+    out = np.zeros((*p.shape, 3), dtype=np.uint8)
+    out[p & g] = (0, 220, 0)       # TP
+    out[p & ~g] = (240, 0, 0)      # FP
+    out[~p & g] = (0, 80, 255)     # FN
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--prediction_dir",
+        "--prediction-dir",
+        dest="prediction_dir",
+        type=str,
+        required=True,
+        help="Canonical full-scene directory produced by predict_full_scenes.py",
+    )
+    parser.add_argument(
+        "--data_root",
+        "--data-root",
+        dest="data_root",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--report",
+        type=str,
+        required=True,
+        help="Official evaluate_full_scenes TEST report JSON",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        choices=["train", "val", "test"],
+    )
+    parser.add_argument(
+        "--output_dir",
+        "--output-dir",
+        dest="output_dir",
+        type=str,
+        required=True,
+    )
+    parser.add_argument(
+        "--fixed_threshold",
+        "--fixed-threshold",
+        dest="fixed_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Optional explicit frozen threshold. If omitted, the official "
+            "report threshold is used. A mismatch with the report is refused."
+        ),
+    )
+    parser.add_argument(
+        "--binary_overlay_alpha",
+        "--binary-overlay-alpha",
+        dest="binary_overlay_alpha",
+        type=float,
+        default=0.55,
+    )
+    parser.add_argument(
+        "--panel_title_bar_h",
+        "--panel-title-bar-h",
+        dest="panel_title_bar_h",
+        type=int,
+        default=40,
+    )
+    parser.add_argument(
+        "--panel_font_size",
+        "--panel-font-size",
+        dest="panel_font_size",
+        type=int,
+        default=18,
+    )
+    parser.add_argument(
+        "--top_k",
+        "--top-k",
+        dest="top_k",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Main export
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    prediction_dir = Path(args.prediction_dir).resolve()
+    data_root = Path(args.data_root).resolve()
+    report_path = Path(args.report).resolve()
+    out_dir = Path(args.output_dir).resolve()
+
+    if not prediction_dir.is_dir():
+        raise FileNotFoundError(
+            f"Prediction directory not found: {prediction_dir}"
+        )
+    if not data_root.is_dir():
+        raise FileNotFoundError(
+            f"Data root not found: {data_root}"
+        )
+    if not report_path.is_file():
+        raise FileNotFoundError(
+            f"Official report not found: {report_path}"
+        )
+
+    report = load_official_report(report_path)
+    evaluation = report["evaluation"]
+
+    report_split = str(evaluation.get("split", "")).strip().lower()
+    if report_split and report_split != str(args.split).lower():
+        raise RuntimeError(
+            f"Split mismatch: CLI={args.split}, report={report_split}"
+        )
+
+    report_threshold = float(evaluation["threshold"])
+    threshold = (
+        report_threshold
+        if args.fixed_threshold is None
+        else float(args.fixed_threshold)
+    )
+
+    if abs(threshold - report_threshold) > 1e-12:
+        raise RuntimeError(
+            f"Threshold mismatch: CLI={threshold}, "
+            f"official report={report_threshold}. "
+            "Refusing non-canonical export."
+        )
+
+    # If a previous failed export created only empty directories, remove/rebuild.
+    if out_dir.exists():
+        existing_files = [
+            p for p in out_dir.rglob("*") if p.is_file()
+        ]
+        if existing_files:
+            if not args.overwrite:
+                raise RuntimeError(
+                    f"Output directory already contains files: {out_dir}\n"
+                    "Use --overwrite only if you intentionally want to "
+                    "replace this visualization export."
+                )
+            shutil.rmtree(out_dir)
+        else:
+            shutil.rmtree(out_dir)
+
+    ensure_dir(out_dir)
+
+    subdirs = [
+        "npz",
+        "panels",
+        "preview_t1",
+        "preview_t2",
+        "prob",
+        "temporal_delta",
+        "gt_mask",
+        "mask",
+        "error_map",
+        "overlay_pred",
+        "overlay_gt",
+        "best_iou_panels",
+        "worst_iou_panels",
+    ]
+
+    for sub in subdirs:
+        ensure_dir(out_dir / sub)
+
+    manifest = load_prediction_manifest(prediction_dir)
+    manifest_rows = canonical_manifest_rows(
+        prediction_dir,
+        manifest,
+    )
+
+    expected_scene_count = int(evaluation["scene_count"])
+
+    if len(manifest_rows) != expected_scene_count:
+        raise RuntimeError(
+            f"Manifest scene count={len(manifest_rows)}, "
+            f"official report scene count={expected_scene_count}"
+        )
+
+    split_root = find_split_root(data_root, args.split)
+    dir_a = find_subdir(split_root, ("A", "a"))
+    dir_b = find_subdir(split_root, ("B", "b"))
+    dir_l = find_subdir(
+        split_root,
+        ("label", "Label", "LABEL", "labels", "Labels"),
+    )
+
+    expected_counts = official_confusion(report)
+    discovery_json = out_dir / "probability_key_discovery.json"
+
+    print("=" * 96)
+    print("FINAL CANONICAL FULL-SCENE VISUAL EXPORT — HISTORICAL PANEL STYLE")
+    print("=" * 96)
+    print(f"Prediction dir      : {prediction_dir}")
+    print(f"Output dir          : {out_dir}")
+    print(f"Scenes              : {len(manifest_rows)}")
+    print(f"Frozen threshold    : {threshold:.3f}")
+    print("GPU inference       : NO")
+    print("Threshold tuning    : NO")
+    print("Legacy postprocess  : NO")
+    print("Panel layout        : historical one-row horizontal style")
+    print("=" * 96)
+
+    selected_key = identify_probability_key(
+        manifest_rows=manifest_rows,
+        gt_dir=dir_l,
+        threshold=threshold,
+        official_counts=expected_counts,
+        diagnostic_path=discovery_json,
+    )
+
+    print()
+    print(
+        f"[VERIFIED] Canonical full-scene probability key: "
+        f"{selected_key}"
+    )
+    print()
+
+    rows: List[Dict[str, Any]] = []
+    global_counts = {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "tn": 0,
+    }
+
+    for row in tqdm(
+        manifest_rows,
+        desc=f"Export {args.split}",
+    ):
+        patch_id = str(row["scene_id"])
+        archive_path = Path(row["archive_path"])
+        expected_hw = (
+            int(row["source_height"]),
+            int(row["source_width"]),
+        )
+
+        t1_full = load_rgb(
+            find_scene_file(dir_a, patch_id)
+        )
+        t2_full = load_rgb(
+            find_scene_file(dir_b, patch_id)
+        )
+        gt_full = load_binary(
+            find_scene_file(dir_l, patch_id)
+        )
+
+        prob = load_probability(
+            archive_path,
+            selected_key,
+            expected_hw,
+        )
+
+        if (
+            t1_full.shape[:2] != prob.shape
+            or t2_full.shape[:2] != prob.shape
+            or gt_full.shape != prob.shape
+        ):
+            raise RuntimeError(
+                f"{patch_id}: shape mismatch: "
+                f"T1={t1_full.shape}, T2={t2_full.shape}, "
+                f"GT={gt_full.shape}, prob={prob.shape}"
+            )
+
+        # This is the AUTHORITATIVE semantic prediction.
+        final_mask = (prob >= threshold).astype(np.uint8)
+
+        # Purely visual diagnostic, identical concept to old exporter.
+        temporal_delta = compute_temporal_delta_support(
+            t1_full,
+            t2_full,
+        )
+
+        scene_counts = confusion(
+            final_mask,
+            gt_full,
+        )
+        scene_metrics = metrics_from_counts(
+            scene_counts
+        )
+        add_counts(
+            global_counts,
+            scene_counts,
+        )
+
+        error_map = make_error_map(
+            final_mask,
+            gt_full,
+        )
+
+        overlay_pred = make_binary_overlay(
+            t2_full,
+            final_mask,
+            alpha=float(args.binary_overlay_alpha),
+            color=(255, 0, 0),
+        )
+
+        overlay_gt = make_binary_overlay(
+            t2_full,
+            gt_full,
+            alpha=float(args.binary_overlay_alpha),
+            color=(255, 0, 0),
+        )
+
+        # Individual images, using the familiar historical folder names.
+        save_png_rgb(
+            t1_full,
+            out_dir / "preview_t1" / f"{patch_id}.png",
+        )
+        save_png_rgb(
+            t2_full,
+            out_dir / "preview_t2" / f"{patch_id}.png",
+        )
+        save_png_gray(
+            prob,
+            out_dir / "prob" / f"{patch_id}.png",
+        )
+        save_png_gray(
+            temporal_delta,
+            out_dir / "temporal_delta" / f"{patch_id}.png",
+        )
+        save_png_binary(
+            gt_full,
+            out_dir / "gt_mask" / f"{patch_id}.png",
+        )
+        save_png_binary(
+            final_mask,
+            out_dir / "mask" / f"{patch_id}.png",
+        )
+        save_png_rgb(
+            error_map,
+            out_dir / "error_map" / f"{patch_id}.png",
+        )
+        save_png_rgb(
+            overlay_pred,
+            out_dir / "overlay_pred" / f"{patch_id}.png",
+        )
+        save_png_rgb(
+            overlay_gt,
+            out_dir / "overlay_gt" / f"{patch_id}.png",
+        )
+
+        # Small archive for convenient later inspection.
+        np.savez_compressed(
+            out_dir / "npz" / f"{patch_id}.npz",
+            patch_id=np.asarray(patch_id),
+            gt_mask=gt_full.astype(np.uint8),
+            prob_map=prob.astype(np.float32),
+            temporal_delta=temporal_delta.astype(np.float32),
+            pred_mask=final_mask.astype(np.uint8),
+            error_map=error_map.astype(np.uint8),
+            threshold=np.float32(threshold),
+            tp=np.int64(scene_counts["tp"]),
+            fp=np.int64(scene_counts["fp"]),
+            fn=np.int64(scene_counts["fn"]),
+            tn=np.int64(scene_counts["tn"]),
+            iou=np.float64(scene_metrics["iou"]),
+            f1=np.float64(scene_metrics["f1"]),
+            precision=np.float64(scene_metrics["precision"]),
+            recall=np.float64(scene_metrics["recall"]),
+            oa=np.float64(scene_metrics["oa"]),
+        )
+
+        # -------------------------------------------------------------------
+        # IMPORTANT: this intentionally reproduces the old ONE-LONG-ROW style.
+        #
+        # Old obsolete columns:
+        #   Raw mask | Precision mask | Final mask
+        #
+        # are replaced by scientifically meaningful current columns:
+        #   Ground truth | Official prediction | Error map
+        #
+        # because the canonical final protocol has NO semantic post-processing.
+        # -------------------------------------------------------------------
+        panel = make_panel(
+            [
+                ("T1 image", t1_full),
+                ("T2 image", t2_full),
+                (
+                    "Model probability",
+                    np.stack(
+                        [float01_to_uint8_gray(prob)] * 3,
+                        axis=-1,
+                    ),
+                ),
+                (
+                    "Temporal delta",
+                    np.stack(
+                        [float01_to_uint8_gray(temporal_delta)] * 3,
+                        axis=-1,
+                    ),
+                ),
+                (
+                    "Ground truth",
+                    np.stack(
+                        [binary_mask_to_uint8(gt_full)] * 3,
+                        axis=-1,
+                    ),
+                ),
+                (
+                    f"Prediction @ {threshold:.3f}",
+                    np.stack(
+                        [binary_mask_to_uint8(final_mask)] * 3,
+                        axis=-1,
+                    ),
+                ),
+                (
+                    "Error map TP/FP/FN",
+                    error_map,
+                ),
+                (
+                    "Prediction overlay",
+                    overlay_pred,
+                ),
+                (
+                    "GT overlay",
+                    overlay_gt,
+                ),
+            ],
+            pad=8,
+            title_bar_h=int(args.panel_title_bar_h),
+            font_size=int(args.panel_font_size),
+        )
+
+        panel_path = (
+            out_dir / "panels" / f"{patch_id}.png"
+        )
+        save_png_rgb(
+            panel,
+            panel_path,
+        )
+
+        rows.append(
+            {
+                "patch_id": patch_id,
+                "source_tile_count": int(
+                    row.get("tile_count", 0)
+                ),
+                "probability_key": selected_key,
+                "threshold": threshold,
+                "prob_mean": float(prob.mean()),
+                "temporal_delta_mean": float(
+                    temporal_delta.mean()
+                ),
+                "pred_ratio": float(final_mask.mean()),
+                "gt_ratio": float(gt_full.mean()),
+                "tp": int(scene_counts["tp"]),
+                "fp": int(scene_counts["fp"]),
+                "fn": int(scene_counts["fn"]),
+                "tn": int(scene_counts["tn"]),
+                "iou": float(scene_metrics["iou"]),
+                "f1": float(scene_metrics["f1"]),
+                "precision": float(
+                    scene_metrics["precision"]
+                ),
+                "recall": float(
+                    scene_metrics["recall"]
+                ),
+                "oa": float(scene_metrics["oa"]),
+                "panel": str(panel_path),
+            }
+        )
+
+    global_metrics = metrics_from_counts(
+        global_counts
+    )
+
+    # Hard scientific gate AFTER all panels have been generated.
+    verify_official_result(
+        global_counts,
+        global_metrics,
+        report,
+    )
+
+    # Per-scene CSV in natural scene order.
+    csv_path = out_dir / "export_summary.csv"
+
+    fieldnames = [
+        "patch_id",
+        "source_tile_count",
+        "probability_key",
+        "threshold",
+        "prob_mean",
+        "temporal_delta_mean",
+        "pred_ratio",
+        "gt_ratio",
+        "tp",
+        "fp",
+        "fn",
+        "tn",
+        "iou",
+        "f1",
+        "precision",
+        "recall",
+        "oa",
+        "panel",
+    ]
+
+    with open(
+        csv_path,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[INFO] Export summary CSV saved to: {csv_path}")
+    ranked = sorted(
+        rows,
+        key=lambda row: float(row["iou"]),
+        reverse=True,
+    )
+
+    top_k = max(
+        0,
+        min(int(args.top_k), len(ranked)),
+    )
+
+    for item in ranked[:top_k]:
+        source = Path(item["panel"])
+        shutil.copy2(
+            source,
+            out_dir / "best_iou_panels" / source.name,
+        )
+
+    for item in reversed(ranked[-top_k:]):
+        source = Path(item["panel"])
+        shutil.copy2(
+            source,
+            out_dir / "worst_iou_panels" / source.name,
+        )
+
+    ranked_csv = out_dir / "export_summary_ranked_by_iou.csv"
+
+    with open(
+        ranked_csv,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+        writer.writerows(ranked)
+
+    verification = {
+        "purpose": (
+            "canonical_full_scene_visualization_with_historical_horizontal_panel_style"
+        ),
+        "prediction_dir": str(prediction_dir),
+        "prediction_manifest": str(
+            prediction_dir / "prediction_manifest.json"
+        ),
+        "official_report": str(report_path),
+        "output_dir": str(out_dir),
+        "split": str(args.split),
+        "scene_count": len(rows),
+        "source_pixel_count": int(
+            sum(global_counts.values())
+        ),
+        "selected_probability_key": selected_key,
+        "threshold": threshold,
+        "no_model_reinference": True,
+        "no_threshold_search": True,
+        "semantic_postprocessing": "none",
+        "panel_layout": "historical_one_row_horizontal",
+        "confusion": global_counts,
+        "metrics": global_metrics,
+        "official_confusion_exact_match": True,
+        "official_metrics_exact_match": True,
+        "error_map_legend": {
+            "TN": "black",
+            "TP": "green",
+            "FP": "red",
+            "FN": "blue",
+        },
+        "files": {
+            "summary_csv": str(csv_path),
+            "ranked_csv": str(ranked_csv),
+            "probability_key_discovery": str(
+                discovery_json
+            ),
+        },
+    }
+
+    verification_path = (
+        out_dir / "visualization_verification.json"
+    )
+    verification_path.write_text(
+        json.dumps(
+            verification,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    print()
+    print("=" * 96)
+    print(
+        "EXPORT COMPLETE — HISTORICAL PANEL STYLE + "
+        "EXACT OFFICIAL TEST MATCH VERIFIED"
+    )
+    print("=" * 96)
+    print(f"Probability key : {selected_key}")
+    print(f"Threshold       : {threshold:.3f}")
+    print(f"Scenes          : {len(rows)}")
+    print(f"TP              : {global_counts['tp']:,}")
+    print(f"FP              : {global_counts['fp']:,}")
+    print(f"FN              : {global_counts['fn']:,}")
+    print(f"TN              : {global_counts['tn']:,}")
+    print(f"IoU             : {global_metrics['iou'] * 100:.4f}%")
+    print(f"F1              : {global_metrics['f1'] * 100:.4f}%")
+    print(
+        f"Precision       : "
+        f"{global_metrics['precision'] * 100:.4f}%"
+    )
+    print(
+        f"Recall          : "
+        f"{global_metrics['recall'] * 100:.4f}%"
+    )
+    print(f"OA              : {global_metrics['oa'] * 100:.4f}%")
+    print(f"Panels          : {out_dir / 'panels'}")
+    print(f"Summary CSV     : {csv_path}")
+    print(f"Verification    : {verification_path}")
+    print("=" * 96)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

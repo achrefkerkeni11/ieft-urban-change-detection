@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from IEFT.modules.instance_change_head import InstanceChangeHead
 
 
 class _ConvGN(nn.Module):
@@ -107,7 +108,14 @@ class _UpFuse(nn.Module):
 
 
 class PixelObjectDecoder(nn.Module):
-    def __init__(self, token_dim: int = 160, dropout: float = 0.08):
+    def __init__(
+        self,
+        token_dim: int = 160,
+        dropout: float = 0.08,
+        use_instance_head: bool = False,
+        instance_detach_shared_features: bool = True,
+        instance_init_seed: int = 1702,
+    ):
         super().__init__()
         self.token_stem = nn.Sequential(_ConvGN(token_dim, 160), _ResBlock(160, dropout))
         self.up0 = _UpFuse(160, 128, 128, dropout=dropout)
@@ -117,6 +125,38 @@ class PixelObjectDecoder(nn.Module):
         self.refine = nn.Sequential(_ConvGN(32, 32), _ResBlock(32, dropout))
         self.out_head = nn.Conv2d(32, 1, 1)
         self.boundary_head = nn.Conv2d(32, 1, 1)
+        self.use_instance_head = False
+        self.instance_head = None
+        self.instance_detach_shared_features = bool(instance_detach_shared_features)
+        self.instance_init_seed = int(instance_init_seed)
+        self.instance_dropout = float(dropout)
+        if bool(use_instance_head):
+            self.enable_instance_head(
+                detach_shared_features=self.instance_detach_shared_features,
+                init_seed=self.instance_init_seed,
+            )
+
+    def enable_instance_head(
+        self,
+        detach_shared_features: bool = True,
+        init_seed: int = 1702,
+    ) -> None:
+        """Attach the instance head without perturbing the global RNG stream.
+
+        The semantic decoder is constructed independently.  By default the
+        center/offset branch receives a detached dense feature map so its loss
+        cannot alter the semantic RGB trunk.
+        """
+        self.instance_detach_shared_features = bool(detach_shared_features)
+        self.instance_init_seed = int(init_seed)
+        if self.instance_head is None:
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(self.instance_init_seed)
+                self.instance_head = InstanceChangeHead(
+                    in_ch=32,
+                    dropout=self.instance_dropout,
+                )
+        self.use_instance_head = True
 
     def forward(self, token_map: torch.Tensor, rgb_feats):
         x1, x2, x3, x4 = rgb_feats
@@ -126,11 +166,27 @@ class PixelObjectDecoder(nn.Module):
         x = self.up2(x, x2)
         x = self.up3(x, x1)
         x = self.refine(x)
-        return self.out_head(x), self.boundary_head(x)
+        seg_logits = self.out_head(x)
+        bnd_logits = self.boundary_head(x)
+        if self.instance_head is not None:
+            instance_input = x.detach() if self.instance_detach_shared_features else x
+            center_logits, offset = self.instance_head(instance_input)
+            return seg_logits, bnd_logits, center_logits, offset
+        return seg_logits, bnd_logits
 
 
 class MultiScalePixelObjectChangeDecoder(nn.Module):
-    def __init__(self, hidden_size: int = 384, grid_size: int = 16, num_levels: int = 4, decoder_dim: int = 160, dropout: float = 0.08):
+    def __init__(
+        self,
+        hidden_size: int = 384,
+        grid_size: int = 16,
+        num_levels: int = 4,
+        decoder_dim: int = 160,
+        dropout: float = 0.08,
+        use_instance_head: bool = False,
+        instance_detach_shared_features: bool = True,
+        instance_init_seed: int = 1702,
+    ):
         super().__init__()
         self.grid_size = grid_size
         self.num_levels = num_levels
@@ -144,7 +200,25 @@ class MultiScalePixelObjectChangeDecoder(nn.Module):
         self.level_feat_weights = nn.Parameter(torch.zeros(num_levels))
 
         self.rgb_encoder = RGBFusionEncoder(in_ch=12, dropout=dropout)
-        self.pixel_decoder = PixelObjectDecoder(token_dim=decoder_dim, dropout=dropout)
+        self.use_instance_head = bool(use_instance_head)
+        self.pixel_decoder = PixelObjectDecoder(
+            token_dim=decoder_dim,
+            dropout=dropout,
+            use_instance_head=use_instance_head,
+            instance_detach_shared_features=instance_detach_shared_features,
+            instance_init_seed=instance_init_seed,
+        )
+
+    def enable_instance_head(
+        self,
+        detach_shared_features: bool = True,
+        init_seed: int = 1702,
+    ) -> None:
+        self.pixel_decoder.enable_instance_head(
+            detach_shared_features=detach_shared_features,
+            init_seed=init_seed,
+        )
+        self.use_instance_head = True
 
     def forward(self, level_t1_feats: list, level_t2_feats: list, t1: torch.Tensor, t2: torch.Tensor):
         assert len(level_t1_feats) == self.num_levels
@@ -174,6 +248,9 @@ class MultiScalePixelObjectChangeDecoder(nn.Module):
         prod = t1 * t2
         rgb_in = torch.cat([t1, t2, diff, prod], dim=1)
         rgb_feats = self.rgb_encoder(rgb_in)
-        dense_logits, boundary_logits = self.pixel_decoder(token_map, rgb_feats)
-
+        pix_out = self.pixel_decoder(token_map, rgb_feats)
+        if self.use_instance_head:
+            dense_logits, boundary_logits, center_logits, offset = pix_out
+            return coarse_logits, dense_logits, boundary_logits, level_logits, center_logits, offset
+        dense_logits, boundary_logits = pix_out
         return coarse_logits, dense_logits, boundary_logits, level_logits

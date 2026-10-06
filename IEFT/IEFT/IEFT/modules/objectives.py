@@ -2,6 +2,119 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from IEFT.modules.instance_targets import InstanceLoss
+
+
+class BinaryChangeMetricAccumulator:
+    """Accumulate dense binary confusion counts without batch-average bias."""
+
+    METRIC_NAMES = ("precision", "recall", "f1", "iou", "oa")
+
+    def __init__(self, threshold: float = 0.5):
+        threshold = float(threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError(f"Binary evaluation threshold must be in [0,1], got {threshold}")
+        self.threshold = threshold
+        self.reset()
+
+    def reset(self):
+        # Lazily allocate on the prediction device.  This avoids a GPU-to-CPU
+        # synchronization for every validation/test batch.
+        self._counts = None
+
+    @property
+    def counts(self):
+        if self._counts is None:
+            return torch.zeros(4, dtype=torch.long)
+        return self._counts
+
+    @torch.no_grad()
+    def update_from_logits(self, logits: torch.Tensor, targets: torch.Tensor):
+        if logits.ndim == 3:
+            logits = logits.unsqueeze(1)
+        if targets.ndim == 3:
+            targets = targets.unsqueeze(1)
+        if logits.ndim != 4 or targets.ndim != 4:
+            raise ValueError(
+                "Dense metric tensors must be [B,H,W] or [B,C,H,W], got "
+                f"{tuple(logits.shape)} and {tuple(targets.shape)}"
+            )
+        if logits.shape[0] != targets.shape[0]:
+            raise ValueError(
+                f"Metric batch sizes differ: {logits.shape[0]} != {targets.shape[0]}"
+            )
+        if logits.shape[-2:] != targets.shape[-2:]:
+            logits = F.interpolate(
+                logits.float(),
+                size=targets.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        if logits.shape[1] != targets.shape[1]:
+            if logits.shape[1] == 1:
+                logits = logits.expand(-1, targets.shape[1], -1, -1)
+            elif targets.shape[1] == 1:
+                targets = targets.expand(-1, logits.shape[1], -1, -1)
+            else:
+                raise ValueError(
+                    f"Metric channel counts differ: {logits.shape[1]} != {targets.shape[1]}"
+                )
+
+        predictions = torch.sigmoid(logits.float()) >= self.threshold
+        truth = targets.to(device=logits.device).float() >= 0.5
+        tp = torch.count_nonzero(predictions & truth)
+        fp = torch.count_nonzero(predictions & ~truth)
+        fn = torch.count_nonzero(~predictions & truth)
+        tn = torch.count_nonzero(~predictions & ~truth)
+        batch_counts = torch.stack([tp, fp, fn, tn]).to(dtype=torch.long).detach()
+        if self._counts is None:
+            self._counts = torch.zeros_like(batch_counts)
+        self._counts += batch_counts
+
+    @torch.no_grad()
+    def compute(self, synchronize: bool = False):
+        counts = self.counts.clone()
+        if synchronize and torch.distributed.is_available() and torch.distributed.is_initialized():
+            # NCCL requires a CUDA tensor; counts already live beside predictions.
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+
+        tp, fp, fn, tn = counts.to(dtype=torch.float64).unbind(0)
+
+        def safe_div(numerator, denominator):
+            return torch.where(
+                denominator > 0,
+                numerator / denominator.clamp_min(1.0),
+                torch.zeros_like(numerator),
+            )
+
+        precision = safe_div(tp, tp + fp)
+        recall = safe_div(tp, tp + fn)
+        f1 = safe_div(2.0 * tp, 2.0 * tp + fp + fn)
+        iou = safe_div(tp, tp + fp + fn)
+        oa = safe_div(tp + tn, tp + fp + fn + tn)
+        return {
+            "precision": precision.float(),
+            "recall": recall.float(),
+            "f1": f1.float(),
+            "iou": iou.float(),
+            "oa": oa.float(),
+            "tp": counts[0],
+            "fp": counts[1],
+            "fn": counts[2],
+            "tn": counts[3],
+            "threshold": counts.new_tensor(self.threshold, dtype=torch.float32),
+        }
+
+
+def update_active_change_metrics(pl_module, dense_logits, targets):
+    """Update the callback-owned validation/test accumulator, if active."""
+
+    accumulator = getattr(pl_module, "_change_metric_accumulator", None)
+    stage = getattr(pl_module, "_change_metric_stage", None)
+    if accumulator is None or stage not in {"val", "test"}:
+        return
+    accumulator.update_from_logits(dense_logits, targets)
+
 
 def init_weights(module):
     if isinstance(module, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
@@ -200,6 +313,7 @@ def compute_change_supervised(pl_module, batch, infer=None):
     gt_loss_4d = _prepare_gt_for_change_losses(gt_4d, pl_module.hparams.config)
 
     dense_logits_4d = dense_logits.unsqueeze(1) if dense_logits.dim() == 3 else dense_logits
+    update_active_change_metrics(pl_module, dense_logits_4d, gt_loss_4d)
 
     g = int(local_logits.shape[1] ** 0.5)
     pooled = F.adaptive_avg_pool2d(gt_loss_4d, (g, g))
@@ -281,6 +395,31 @@ def compute_change_supervised(pl_module, batch, infer=None):
         + float(pl_module.hparams.config.get("change_dense_completion_loss_weight", pl_module.hparams.config.get("change_dense_completion_weight", 0.08))) * completion_loss
     )
 
+    instance_outputs = {}
+    if bool(pl_module.hparams.config.get("use_instance_head", False)):
+        center_logits = infer.get("change_instance_center_logits")
+        offsets_yx = infer.get("change_instance_offset")
+        if center_logits is None or offsets_yx is None:
+            raise RuntimeError(
+                "use_instance_head=True but infer() did not return both "
+                "change_instance_center_logits and change_instance_offset"
+            )
+        instance_loss_fn = getattr(pl_module, "instance_loss_fn", None)
+        if instance_loss_fn is None:
+            instance_loss_fn = InstanceLoss(
+                w_center=float(pl_module.hparams.config.get("instance_w_center", 1.0)),
+                w_offset=float(pl_module.hparams.config.get("instance_w_offset", 0.05)),
+                sigma=float(pl_module.hparams.config.get("instance_center_sigma", 6.0)),
+                use_watershed=bool(pl_module.hparams.config.get("instance_target_use_watershed", True)),
+                min_peak_distance=int(pl_module.hparams.config.get("instance_target_min_peak_distance", 12)),
+                min_peak_height=float(pl_module.hparams.config.get("instance_target_min_peak_height", 3.0)),
+                min_instance_area=int(pl_module.hparams.config.get("instance_target_min_area", 64)),
+            )
+        instance_outputs = instance_loss_fn(center_logits, offsets_yx, gt_loss_4d)
+        total_loss = total_loss + float(
+            pl_module.hparams.config.get("instance_loss_weight", 0.3)
+        ) * instance_outputs["loss_instance"]
+
     return {
         "loss": total_loss,
         "dense_bce": dense_bce,
@@ -300,4 +439,5 @@ def compute_change_supervised(pl_module, batch, infer=None):
         "change_probs_global": infer.get("change_probs_global", global_logits.new_zeros((global_logits.shape[0], 1))),
         "osm_reliability": infer.get("osm_reliability", global_logits.new_zeros((global_logits.shape[0], 1))),
         "clip_reliability": infer.get("clip_reliability", global_logits.new_zeros((global_logits.shape[0], 1))),
+        **instance_outputs,
     }

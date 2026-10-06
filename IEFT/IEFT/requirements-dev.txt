@@ -1,0 +1,3 @@
+-r requirements-levir.txt
+
+pytest>=7,<9

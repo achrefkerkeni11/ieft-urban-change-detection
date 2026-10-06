@@ -33,7 +33,7 @@ def add_decay(model, name, weight_decay=1e-5, lr_decay=0.75, skip_list=[], is_di
     else:
         txt_config = model.text_encoder.config
     txt_fusion_layer = list(range(txt_config.fusion_start, txt_config.fusion_end))
-    layerExtract = '.+\..+\..+\..+\.(\d+)\..*'
+    layerExtract = r'.+\..+\..+\..+\.(\d+)\..*'
 
     for n, p in model.named_parameters():
         if not p.requires_grad:

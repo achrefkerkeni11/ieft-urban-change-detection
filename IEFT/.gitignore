@@ -1,5 +1,8 @@
 # Python artifacts
 __pycache__/
+.pytest_cache/
+.pytest_tmp*/
+.test_tmp/
 *.py[cod]
 *.pyo
 *.pyd
@@ -16,6 +19,12 @@ env/
 outputs/
 result/
 api_runs/
+artifacts/
+logs/
+*.log
+*.tmp
+.coverage
+htmlcov/
 
 # Data directories and cached datasets
 data_*/

@@ -1,4 +1,7 @@
 __pycache__/
+.pytest_cache/
+.pytest_tmp*/
+.test_tmp/
 *.pyc
 *.pyo
 *.pyd
@@ -7,6 +10,12 @@ __pycache__/
 outputs/
 result/
 api_runs/
+artifacts/
+logs/
+*.log
+*.tmp
+.coverage
+htmlcov/
 data_*/
 dummy_data/
 .hf_home/

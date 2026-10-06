@@ -114,7 +114,7 @@ import re
 
 if __name__ == '__main__':
     txt = 'text_encoder.bert.encoder.layer.11.output.LayerNorm.weight'
-    matchStr = '.+\..+\..+\..+\.(\d+)\..*'
+    matchStr = r'.+\..+\..+\..+\.(\d+)\..*'
     match = re.match(matchStr, txt)
     print(match.group(0))
     print(match.group(1))
